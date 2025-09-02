@@ -176,6 +176,8 @@ def download_species_data(**kwargs):
 
 # Tarea C: combinar y transformar
 def merge_and_transform_data(**kwargs):
+    execution_date = kwargs['ds']
+    MERGED_DATA_PATH = f"/tmp/pokemon_data/output/final_{execution_date}.csv"
     with open(POKEMON_DATA_PATH, 'r') as f:
         pokemon_data = json.load(f)
     with open(SPECIES_DATA_PATH, 'r') as f:
@@ -205,11 +207,106 @@ def merge_and_transform_data(**kwargs):
             "special-attack": stats.get("special-attack"),
             "special-defense": stats.get("special-defense"),
             "speed": stats.get("speed"),
+            "grupo": "Grupo 20",
         })
     df = pd.DataFrame(tidy_records)
     os.makedirs(os.path.dirname(MERGED_DATA_PATH), exist_ok=True)
     df.to_csv(MERGED_DATA_PATH, index=False)
     print(f"[INFO] CSV guardado en: {MERGED_DATA_PATH}")
+
+# Tarea D: Nueva tarea para generar un archivo zip con los logs del DAG
+def exportar_logs_reales_zip(**kwargs):
+    import shutil
+
+    execution_date= kwargs['ds']
+
+    # Obteniendo información del dag
+    dag_id= kwargs["dag"].dag_id
+    ti= kwargs["ti"]
+    run_id = ti.run_id
+    logs_path=  f"/usr/local/airflow/logs/dag_id={dag_id}/run_id={run_id}"
+    output_path= f"/tmp/pokemon_data/output/logs_{execution_date}.zip"
+    
+    # Crea la carpeta destino por si no existe
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+
+    # Verificar si existen logs para este DAG
+    if not os.path.exists(logs_path):
+        print(f"[INFO] No se encontró directorio de logs: {logs_path}")
+        return
+
+    # Crea el archivo zip
+    shutil.make_archive(output_path.replace(".zip",""), 'zip', logs_path)
+
+    print(f"[INFO] Logs comprimidos en: {output_path}")
+
+# Tarea E: Nueva tarea que va a enviar el correo
+
+def enviar_correo_manual(**kwargs):
+    import smtplib
+    import os
+    from email.mime.multipart import MIMEMultipart
+    from email.mime.text import MIMEText
+    from email.mime.base import MIMEBase
+    from email import encoders
+    from airflow.hooks.base import BaseHook
+
+    execution_date= kwargs["ds"]
+    output_dir= "/tmp/pokemon_data/output"
+
+    archivos = [f"{output_dir}/logs_{execution_date}.zip", f"{output_dir}/final_{execution_date}.csv"]
+
+    destinatario= "cienciadedatos.frm.utn@gmail.com"
+
+    asunto =  f"Entrega Grupo 20 - {execution_date}"
+    cuerpo =f"""
+    Envío este correo como prueba
+    Adjunto los archivos generados en la ejecución del DAG pokemon_base_etl_parallel del {execution_date}.
+
+    Los archivos adjuntos son: 
+    - final_{execution_date}.csv: Dataset con información de Pokémon
+    - logs_{execution_date}.zip: Logs de la ejecución
+
+    """
+    
+    try:
+        # Obtener credenciales desde la Connection en Airflow
+        conn = BaseHook.get_connection("gmail_smtp")
+        remitente = conn.login
+        contraseña = conn.password
+        servidor = conn.host
+        puerto = conn.port
+
+        # Crear mensaje
+        mensaje = MIMEMultipart()
+        mensaje["From"] = remitente
+        mensaje["To"] = destinatario
+        mensaje["Subject"] = asunto
+        mensaje.attach(MIMEText(cuerpo, "plain"))
+
+        # Adjuntar archivos si existen
+        if archivos:
+            for archivo in archivos:
+                if os.path.exists(archivo):
+                    with open(archivo, "rb") as adj:
+                        parte = MIMEBase("application", "octet-stream")
+                        parte.set_payload(adj.read())
+                        encoders.encode_base64(parte)
+                        parte.add_header("Content-Disposition", f"attachment; filename={os.path.basename(archivo)}")
+                        mensaje.attach(parte)
+                else:
+                    print(f"[WARN] No se encontró el archivo: {archivo}")
+
+        # Conectar y enviar
+        with smtplib.SMTP(servidor, puerto) as server:
+            server.starttls()
+            server.login(remitente, contraseña)
+            server.sendmail(remitente, destinatario, mensaje.as_string())
+
+        print(f"[INFO] Correo enviado con éxito a {destinatario}")
+
+    except Exception as e:
+        print(f"[ERROR] No se pudo enviar el correo: {str(e)}")
 
 # DAG
 with DAG(
@@ -246,4 +343,14 @@ with DAG(
         python_callable=merge_and_transform_data,
     )
 
-    fetch_pokemon_list >> [download_a, download_b] >> merge_transform
+    export_logs = PythonOperator(
+    task_id='exportar_logs_zip',
+    python_callable=exportar_logs_reales_zip,
+    )
+
+    enviar_email = PythonOperator(
+    task_id='enviar_email',
+    python_callable= enviar_correo_manual,
+    )
+
+    fetch_pokemon_list >> [download_a, download_b] >> merge_transform >> export_logs >> enviar_email
