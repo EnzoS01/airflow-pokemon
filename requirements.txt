@@ -1,5 +1,12 @@
-# Astro Runtime includes the following pre-installed providers packages: https://www.astronomer.io/docs/astro/runtime-image-architecture#provider-packages
+# Airflow HTTP provider (para HttpOperator y HttpHook)
 apache-airflow-providers-http
+
+# Manejo de datos
 pandas
+numpy
+
+# Librería para requests
 requests
 
+# Cliente de Spotify
+spotipy
