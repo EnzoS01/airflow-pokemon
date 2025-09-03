@@ -119,35 +119,54 @@ def fetch_spotify_playlist(**kwargs):
     ))
 
     playlist_ids = [
-        "37i9dQZF1DXcBWIGoYBM5M",  # Today's Top Hits
-        "37i9dQZF1DX0XUsuxWHRQd",  # RapCaviar
-        "37i9dQZF1DX4JAvHpjipBk",  # New Music Friday
-        "37i9dQZF1DX4sWSpwq3LiO",  # Peaceful Piano
-        "37i9dQZF1DX1lVhptIYRda"   # Rock Classics
+        "2ln8x063dYgSJKb1vv7Mn1", # playlist personal
     ]
 
     playlist_data = []
+    try:
+        for playlist_id in playlist_ids:
+            try:
+                results = sp.playlist(playlist_id)
+                tracks = sp.playlist_tracks(playlist_id)['items']
+                
+                playlist_info = {
+                    'playlist_id': playlist_id,
+                    'playlist_name': results['name'],
+                    'playlist_description': results.get('description', ''),
+                    'total_tracks': results['tracks']['total'],
+                    'tracks': []
+                }
+                
+                # Obtener información básica de cada track
+                for track in tracks:
+                    if track['track'] and track['track']['id']:
+                        track_info = {
+                            'track_id': track['track']['id'],
+                            'track_name': track['track']['name'],
+                            'artist_name': track['track']['artists'][0]['name'],
+                            'artist_id': track['track']['artists'][0]['id'],
+                            'album_name': track['track']['album']['name'],
+                            'duration_ms': track['track']['duration_ms'],
+                            'popularity': track['track']['popularity']
+                        }
+                        playlist_info['tracks'].append(track_info)
+                
+                playlist_data.append(playlist_info)
+                logging.info(f"Playlist {results['name']} processed with {len(playlist_info['tracks'])} tracks")
+                
+            except Exception as e:
+                logging.error(f"Error processing playlist {playlist_id}: {str(e)}")
+                continue
+        
+        # Guardar datos de playlist
+        with open(SPOTIFY_PLAYLIST_PATH, 'w') as f:
+            json.dump(playlist_data, f)
+            
+    except Exception as e:
+        logging.error(f"Error in Spotify data fetching: {str(e)}")
+        raise e
     
-    for playlist_id in playlist_ids:
-        try:
-            results = sp.playlist(playlist_id)
-            tracks = results['tracks']['items']
-            playlist_info = {
-                'playlist_id': playlist_id,
-                'playlist_name': results['name'],
-                'total_tracks': results['tracks']['total'],
-                'tracks': [
-                    {
-                        'track_id': t['track']['id'],
-                        'track_name': t['track']['name'],
-                        'artist_name': t['track']['artists'][0]['name']
-                    } for t in tracks if t['track'] and t['track']['id']
-                ]
-            }
-            playlist_data.append(playlist_info)
-            logging.info(f"Processed {results['name']} with {len(playlist_info['tracks'])} tracks")
-        except Exception as e:
-            logging.error(f"Error with playlist {playlist_id}: {e}")
+    logging.info(f"Processed {len(playlist_data)} playlists")
     return playlist_data
 
 
@@ -161,6 +180,7 @@ def fetch_audio_features(**kwargs):
     os.makedirs(os.path.dirname(AUDIO_FEATURES_PATH), exist_ok=True)
     
     # Cargar datos de playlist
+    
     with open(SPOTIFY_PLAYLIST_PATH, 'r') as f:
         playlist_data = json.load(f)
     
