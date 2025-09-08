@@ -1,553 +1,335 @@
+# dags/energy_demand_pipeline.py
+from datetime import datetime, timedelta
 from airflow import DAG
 from airflow.operators.python import PythonOperator
-from airflow.providers.http.operators.http import HttpOperator
-from airflow.providers.http.hooks.http import HttpHook
-from airflow.hooks.base import BaseHook  # o airflow.hooks.base_hook.BaseHook según tu versión
-
-from datetime import datetime, timedelta
 import pandas as pd
-import numpy as np
-import os
-import json
-import time
-import logging
-
-import spotipy
-from spotipy.oauth2 import SpotifyClientCredentials
-
 import requests
-from requests.exceptions import ConnectionError, HTTPError
-
-# Configuración
-logging.getLogger("airflow.hooks.base").setLevel(logging.ERROR)
-
-# Paths para almacenamiento de datos
-WEATHER_DATA_PATH = "/tmp/music_weather_data/weather_data.json"
-SPOTIFY_PLAYLIST_PATH = "/tmp/music_weather_data/playlist_data.json"
-AUDIO_FEATURES_PATH = "/tmp/music_weather_data/audio_features.json"
-FINAL_DATASET_PATH = "/tmp/music_weather_data/final_dataset.csv"
-RECOMMENDATIONS_PATH = "/tmp/music_weather_data/recommendations.json"
-
-# Ciudades para analizar
-CITIES = ["London", "New York", "Tokyo", "Sydney", "Madrid", "Berlin", "Paris", "Moscow", "Mexico City", "Toronto"]
+import json
+import os
+import logging
+import numpy as np
+from urllib.parse import urlencode
 
 default_args = {
-    'owner': 'grupo20',
-    'start_date': datetime.today() - timedelta(days=1),
-    'retries': 1,
-    'retry_delay': timedelta(minutes=2),
-    'email_on_failure': False,
+    'owner': 'airflow',
     'depends_on_past': False,
+    'start_date': datetime(2025, 9, 8),  # Empezar desde hoy
+    'email_on_failure': False,
+    'email_on_retry': False,
+    'retries': 2,
+    'retry_delay': timedelta(minutes=3)
 }
 
-# Tarea 1: Obtener datos meteorológicos para múltiples ciudades
-def fetch_weather_data(**kwargs):
-    import os
-    import json
-    import time
-    import logging 
-    from airflow.providers.http.hooks.http import HttpHook
-    
-    os.makedirs(os.path.dirname(WEATHER_DATA_PATH), exist_ok=True)
-    
-    # Obtener API key desde Airflow Connections
-    openweather_conn = BaseHook.get_connection("openweather_api")
-    api_key = openweather_conn.password
-    
-    weather_data = []
-    hook = HttpHook(http_conn_id='openweather_api', method='GET')
-    
-    try:
-        for i, city in enumerate(CITIES):
-            endpoint = f"/data/2.5/weather?q={city}&appid={api_key}&units=metric"
-            
-            try:
-                response = hook.run(endpoint)
-                city_weather = response.json()
-                
-                # Extraer información relevante
-                weather_info = {
-                    'city': city,
-                    'timestamp': datetime.now().isoformat(),
-                    'temperature': city_weather['main']['temp'],
-                    'humidity': city_weather['main']['humidity'],
-                    'pressure': city_weather['main']['pressure'],
-                    'weather_condition': city_weather['weather'][0]['main'],
-                    'weather_description': city_weather['weather'][0]['description'],
-                    'wind_speed': city_weather['wind']['speed'],
-                    'cloudiness': city_weather['clouds']['all'] if 'clouds' in city_weather else None
-                }
-                
-                weather_data.append(weather_info)
-                logging.info(f"Weather data fetched for {city}")
-                
-            except Exception as e:
-                logging.error(f"Error fetching weather for {city}: {str(e)}")
-                continue
-            
-            # Pausa para no saturar la API
-            time.sleep(0.5)
-            
-            # Guardado parcial cada 5 ciudades
-            if (i + 1) % 5 == 0:
-                with open(WEATHER_DATA_PATH, 'w') as f:
-                    json.dump(weather_data, f)
-    
-    except Exception as e:
-        logging.error(f"Error in weather data fetching: {str(e)}")
-        raise e
-    
-    # Guardado final
-    with open(WEATHER_DATA_PATH, 'w') as f:
-        json.dump(weather_data, f)
-    
-    logging.info(f"Weather data fetched for {len(weather_data)} cities")
-    return weather_data
+def get_data_dir():
+    data_dir = os.getenv("AIRFLOW_DATA_DIR", "/tmp/data")
+    os.makedirs(data_dir, exist_ok=True)
+    return data_dir
 
-from spotipy.oauth2 import SpotifyClientCredentials
-import spotipy
-import logging
-
-def fetch_spotify_playlist(**kwargs):
-    spotify_conn = BaseHook.get_connection("spotify_api")
-    client_id = spotify_conn.login
-    client_secret = spotify_conn.password
-
-    sp = spotipy.Spotify(auth_manager=SpotifyClientCredentials(
-        client_id=client_id,
-        client_secret=client_secret
-    ))
-
-    playlist_ids = [
-        "2ln8x063dYgSJKb1vv7Mn1", # playlist personal
-    ]
-
-    playlist_data = []
-    try:
-        for playlist_id in playlist_ids:
-            try:
-                results = sp.playlist(playlist_id)
-                tracks = sp.playlist_tracks(playlist_id)['items']
-                
-                playlist_info = {
-                    'playlist_id': playlist_id,
-                    'playlist_name': results['name'],
-                    'playlist_description': results.get('description', ''),
-                    'total_tracks': results['tracks']['total'],
-                    'tracks': []
-                }
-                
-                # Obtener información básica de cada track
-                for track in tracks:
-                    if track['track'] and track['track']['id']:
-                        track_info = {
-                            'track_id': track['track']['id'],
-                            'track_name': track['track']['name'],
-                            'artist_name': track['track']['artists'][0]['name'],
-                            'artist_id': track['track']['artists'][0]['id'],
-                            'album_name': track['track']['album']['name'],
-                            'duration_ms': track['track']['duration_ms'],
-                            'popularity': track['track']['popularity']
-                        }
-                        playlist_info['tracks'].append(track_info)
-                
-                playlist_data.append(playlist_info)
-                logging.info(f"Playlist {results['name']} processed with {len(playlist_info['tracks'])} tracks")
-                
-            except Exception as e:
-                logging.error(f"Error processing playlist {playlist_id}: {str(e)}")
-                continue
-        
-        # Guardar datos de playlist
-        with open(SPOTIFY_PLAYLIST_PATH, 'w') as f:
-            json.dump(playlist_data, f)
-            
-    except Exception as e:
-        logging.error(f"Error in Spotify data fetching: {str(e)}")
-        raise e
-    
-    logging.info(f"Processed {len(playlist_data)} playlists")
-    return playlist_data
-
-
-# Tarea 3: Obtener características de audio de las canciones
-def fetch_audio_features(**kwargs):
-    import os
-    import json
-    import time
-    import logging
-    
-    os.makedirs(os.path.dirname(AUDIO_FEATURES_PATH), exist_ok=True)
-    
-    # Cargar datos de playlist
-    
-    with open(SPOTIFY_PLAYLIST_PATH, 'r') as f:
-        playlist_data = json.load(f)
-    
-    # Obtener credenciales Spotify
-    spotify_conn = BaseHook.get_connection("spotify_api")
-    client_id = spotify_conn.login
-    client_secret = spotify_conn.password
-    
-    sp = spotipy.Spotify(auth_manager=SpotifyClientCredentials(
-        client_id=client_id,
-        client_secret=client_secret))
-    
-    audio_features_data = []
-    track_ids = []
-    
-    # Recopilar todos los IDs de tracks
-    for playlist in playlist_data:
-        for track in playlist['tracks']:
-            if track['track_id'] not in track_ids:
-                track_ids.append(track['track_id'])
-    
-    # Obtener características de audio en lotes (máximo 100 por request)
-    try:
-        for i in range(0, len(track_ids), 100):
-            batch_ids = track_ids[i:i+100]
-            features_batch = sp.audio_features(batch_ids)
-            
-            for j, features in enumerate(features_batch):
-                if features:
-                    audio_features_data.append({
-                        'track_id': batch_ids[j],
-                        'danceability': features['danceability'],
-                        'energy': features['energy'],
-                        'key': features['key'],
-                        'loudness': features['loudness'],
-                        'mode': features['mode'],
-                        'speechiness': features['speechiness'],
-                        'acousticness': features['acousticness'],
-                        'instrumentalness': features['instrumentalness'],
-                        'liveness': features['liveness'],
-                        'valence': features['valence'],
-                        'tempo': features['tempo'],
-                        'duration_ms': features['duration_ms'],
-                        'time_signature': features['time_signature']
-                    })
-            
-            # Guardado parcial
-            if (i + 100) % 200 == 0:
-                with open(AUDIO_FEATURES_PATH, 'w') as f:
-                    json.dump(audio_features_data, f)
-                logging.info(f"Processed {i + 100} audio features")
-            
-            # Pausa para no saturar la API
-            time.sleep(0.5)
-    
-    except Exception as e:
-        logging.error(f"Error fetching audio features: {str(e)}")
-        raise e
-    
-    # Guardado final
-    with open(AUDIO_FEATURES_PATH, 'w') as f:
-        json.dump(audio_features_data, f)
-    
-    logging.info(f"Fetched audio features for {len(audio_features_data)} tracks")
-    return audio_features_data
-
-# Tarea 4: Combinar y transformar datos
-def merge_and_transform_data(**kwargs):
-    import os
-    import json
-    import pandas as pd
-    import logging
-    
-    execution_date = kwargs['ds']
-    FINAL_DATASET_PATH = f"/tmp/music_weather_data/final_dataset_{execution_date}.csv"
-    
-    os.makedirs(os.path.dirname(FINAL_DATASET_PATH), exist_ok=True)
-    
-    # Cargar todos los datos
-    with open(WEATHER_DATA_PATH, 'r') as f:
-        weather_data = json.load(f)
-    
-    with open(SPOTIFY_PLAYLIST_PATH, 'r') as f:
-        playlist_data = json.load(f)
-    
-    with open(AUDIO_FEATURES_PATH, 'r') as f:
-        audio_features = json.load(f)
-    
-    # Crear DataFrame de características de audio
-    audio_features_df = pd.DataFrame(audio_features)
-    
-    # Crear DataFrame de tracks con información de playlist
-    tracks_data = []
-    for playlist in playlist_data:
-        for track in playlist['tracks']:
-            track_info = track.copy()
-            track_info['playlist_id'] = playlist['playlist_id']
-            track_info['playlist_name'] = playlist['playlist_name']
-            tracks_data.append(track_info)
-    
-    tracks_df = pd.DataFrame(tracks_data)
-    
-    # Combinar datos de tracks con características de audio
-    merged_df = pd.merge(tracks_df, audio_features_df, on='track_id', how='left')
-    
-    # Función para mapear clima a estado de ánimo
-    def weather_to_mood(weather_info):
-        temp = weather_info['temperature']
-        condition = weather_info['weather_condition']
-        
-        if condition in ['Rain', 'Drizzle', 'Thunderstorm']:
-            if temp > 20:
-                return {'mood': 'cozy', 'energy_level': 0.4, 'valence_level': 0.3}
-            else:
-                return {'mood': 'melancholic', 'energy_level': 0.3, 'valence_level': 0.2}
-        elif condition == 'Clear':
-            if temp > 25:
-                return {'mood': 'happy', 'energy_level': 0.8, 'valence_level': 0.9}
-            else:
-                return {'mood': 'calm', 'energy_level': 0.6, 'valence_level': 0.7}
-        elif condition in ['Clouds', 'Mist', 'Fog']:
-            return {'mood': 'thoughtful', 'energy_level': 0.5, 'valence_level': 0.6}
-        elif condition == 'Snow':
-            return {'mood': 'festive', 'energy_level': 0.7, 'valence_level': 0.8}
-        else:
-            return {'mood': 'neutral', 'energy_level': 0.5, 'valence_level': 0.5}
-    
-    # Crear dataset final con recomendaciones por ciudad
-    final_data = []
-    for city_weather in weather_data:
-        mood_profile = weather_to_mood(city_weather)
-        
-        # Filtrar canciones que coincidan con el perfil de ánimo
-        energy_filter = merged_df['energy'].between(
-            mood_profile['energy_level'] - 0.2, 
-            mood_profile['energy_level'] + 0.2
-        )
-        valence_filter = merged_df['valence'].between(
-            mood_profile['valence_level'] - 0.2, 
-            mood_profile['valence_level'] + 0.2
-        )
-        
-        matching_tracks = merged_df[energy_filter & valence_filter]
-        
-        # Para cada ciudad, tomar las 10 canciones más populares que coincidan
-        top_tracks = matching_tracks.nlargest(10, 'popularity')
-        
-        for _, track in top_tracks.iterrows():
-            recommendation = {
-                'city': city_weather['city'],
-                'weather_condition': city_weather['weather_condition'],
-                'temperature': city_weather['temperature'],
-                'mood_profile': mood_profile['mood'],
-                'target_energy': mood_profile['energy_level'],
-                'target_valence': mood_profile['valence_level'],
-                'track_id': track['track_id'],
-                'track_name': track['track_name'],
-                'artist_name': track['artist_name'],
-                'album_name': track['album_name'],
-                'playlist_name': track['playlist_name'],
-                'energy': track['energy'],
-                'valence': track['valence'],
-                'danceability': track['danceability'],
-                'acousticness': track['acousticness'],
-                'popularity': track['popularity'],
-                'execution_date': execution_date
-            }
-            final_data.append(recommendation)
-    
-    # Crear DataFrame final y guardar como CSV
-    final_df = pd.DataFrame(final_data)
-    final_df.to_csv(FINAL_DATASET_PATH, index=False)
-    
-    logging.info(f"Final dataset created with {len(final_df)} recommendations")
-    return FINAL_DATASET_PATH
-
-# Tarea 5: Generar reporte de recomendaciones
-def generate_recommendations_report(**kwargs):
-    import os
-    import json
-    import pandas as pd
-    import logging
-    
-    execution_date = kwargs['ds']
+def download_cammesa_data(**kwargs):
     ti = kwargs['ti']
-    
-    dataset_path = ti.xcom_pull(task_ids='merge_and_transform_data')
-    RECOMMENDATIONS_PATH = f"/tmp/music_weather_data/recommendations_{execution_date}.json"
-    
-    if not dataset_path or not os.path.exists(dataset_path):
-        logging.error("Dataset path not found")
-        return
-    
-    # Leer dataset final
-    final_df = pd.read_csv(dataset_path)
-    
-    # Generar resumen por ciudad
-    city_summaries = []
-    for city in final_df['city'].unique():
-        city_data = final_df[final_df['city'] == city]
-        city_weather = city_data.iloc[0]  # Tomar primera fila para datos climáticos
-        
-        summary = {
-            'city': city,
-            'weather_condition': city_weather['weather_condition'],
-            'temperature': city_weather['temperature'],
-            'mood_profile': city_weather['mood_profile'],
-            'recommendation_count': len(city_data),
-            'top_artists': city_data['artist_name'].value_counts().head(3).to_dict(),
-            'avg_energy': city_data['energy'].mean(),
-            'avg_valence': city_data['valence'].mean(),
-            'recommendations': []
-        }
-        
-        # Añadir top recomendaciones
-        for _, track in city_data.head(5).iterrows():
-            summary['recommendations'].append({
-                'track_name': track['track_name'],
-                'artist_name': track['artist_name'],
-                'energy': track['energy'],
-                'valence': track['valence']
-            })
-        
-        city_summaries.append(summary)
-    
-    # Guardar reporte
-    with open(RECOMMENDATIONS_PATH, 'w') as f:
-        json.dump(city_summaries, f, indent=2)
-    
-    logging.info(f"Recommendations report generated for {len(city_summaries)} cities")
-    return RECOMMENDATIONS_PATH
+    execution_date = kwargs.get('execution_date') or kwargs.get('data_interval_start') or ti.execution_date
+    file_date_str = execution_date.strftime('%Y%m%d')
 
-# Tarea 6: Enviar correo con reporte
-def send_email_report(**kwargs):
-    import smtplib
-    import os
-    from email.mime.multipart import MIMEMultipart
-    from email.mime.text import MIMEText
-    from email.mime.base import MIMEBase
-    from email import encoders
-    import json
-    import pandas as pd
-    
-    execution_date = kwargs['ds']
-    ti = kwargs['ti']
-    
-    recommendations_path = ti.xcom_pull(task_ids='generate_recommendations_report')
-    dataset_path = f"/tmp/music_weather_data/final_dataset_{execution_date}.csv"
-    
-    if not recommendations_path or not os.path.exists(recommendations_path):
-        print("Recommendations file not found")
-        return
-    
-    # Leer recomendaciones
-    with open(recommendations_path, 'r') as f:
-        recommendations = json.load(f)
-    
-    # Configuración de email
-    destinatario = "cocenzosilva@gmail.com"
-    asunto = f"Music Weather Recommendations Report - {execution_date}"
-    
-    # Crear cuerpo del email
-    cuerpo = f"""
-    <h2>Music Weather Recommendations Report - {execution_date}</h2>
-    <p>Se han generado recomendaciones musicales basadas en el clima para {len(recommendations)} ciudades.</p>
-    
-    <h3>Resumen por Ciudad:</h3>
+    data_dir = get_data_dir()
+    out_csv = f"{data_dir}/cammesa_data_{file_date_str}.csv"
+
+    url = "https://api.cammesa.com/demanda-svc/demanda/ObtieneDemandaYTemperaturaRegion"
+    params = {"id_region": "425"}  # ajustá con el id de región que necesites
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "application/json, text/plain, */*",
+        "Referer": "https://api.cammesa.com/",
+    }
+
+    r = requests.get(url, params=params, headers=headers, timeout=60)
+    r.raise_for_status()
+
+    try:
+        # Caso A: devuelve JSON
+        data = r.json()
+        df = pd.DataFrame(data)   # según estructura real, capaz necesites data['series'] o similar
+        df.to_csv(out_csv, sep=";", index=False, encoding="utf-8")
+        logging.info(f"Guardado CSV a partir de JSON en {out_csv}")
+    except ValueError:
+        # Caso B: devuelve CSV directo
+        with open(out_csv, "wb") as f:
+            f.write(r.content)
+        logging.info(f"Guardado CSV directo en {out_csv}")
+
+    ti.xcom_push(key='cammesa_file_path', value=out_csv)
+    ti.xcom_push(key='download_date', value=execution_date.strftime('%Y-%m-%d'))
+    return f"Datos CAMMESA: {out_csv}"
+
+def create_sample_cammesa_data(execution_date, ti, file_path):
     """
+    Crea datos de muestra realistas basados en el formato de CAMMESA
+    """
+    date_formatted = execution_date.strftime('%d/%m/%Y')
     
-    for city in recommendations:
-        cuerpo += f"""
-        <div style="margin-bottom: 20px; padding: 10px; border: 1px solid #ddd;">
-            <h4>{city['city']} - {city['weather_condition']} ({city['temperature']}°C)</h4>
-            <p>Perfil de ánimo: <strong>{city['mood_profile']}</strong></p>
-            <p>Recomendaciones: {city['recommendation_count']} canciones</p>
-            <p>Artistas más recomendados: {', '.join(city['top_artists'].keys())}</p>
+    # Generar datos cada 5 minutos para un día completo
+    times = []
+    demands = []
+    temps = []
+    
+    base_demand = 20000  # MW base
+    base_temp = 15  # Temperatura base
+    
+    for hour in range(24):
+        for minute in range(0, 60, 5):  # cada 5 minutos
+            time_str = f"{date_formatted} {hour:02d}:{minute:02d}"
+            times.append(time_str)
             
-            <h5>Top Recomendaciones:</h5>
-            <ul>
-        """
-        
-        for rec in city['recommendations']:
-            cuerpo += f"<li>{rec['track_name']} - {rec['artist_name']} (Energy: {rec['energy']:.2f}, Valence: {rec['valence']:.2f})</li>"
-        
-        cuerpo += """
-            </ul>
-        </div>
-        """
+            # Simular demanda con patrón diario
+            hour_factor = 0.8 + 0.4 * np.sin(2 * np.pi * (hour - 6) / 24)
+            demand = int(base_demand * hour_factor + np.random.normal(0, 500))
+            demands.append(demand)
+            
+            # Simular temperatura
+            temp_variation = 5 * np.sin(2 * np.pi * (hour - 12) / 24)
+            temp = round(base_temp + temp_variation + np.random.normal(0, 1), 1)
+            temps.append(temp)
+    
+    # Crear DataFrame con formato CAMMESA
+    df = pd.DataFrame({
+        'fecha': times,
+        'Prevista': [demands[i] if i % 4 == 0 else '' for i in range(len(demands))],
+        'Semana Ant': [demands[i] - np.random.randint(-500, 500) if i % 3 == 0 else '' for i in range(len(demands))],
+        'Ayer': [demands[i] - np.random.randint(-300, 300) if i % 2 == 0 else '' for i in range(len(demands))],
+        'Hoy': demands,
+        'Tem. Prevista': [temps[i] if i % 4 == 0 else '' for i in range(len(temps))],
+        'Tem. Semana Ant.': [temps[i] + np.random.normal(0, 2) if i % 3 == 0 else '' for i in range(len(temps))],
+        'Tem. Ayer': [temps[i] + np.random.normal(0, 1) if i % 2 == 0 else '' for i in range(len(temps))],
+        'Tem. Hoy': temps
+    })
+    
+    # Guardar como CSV con formato correcto
+    df.to_csv(file_path, sep=';', index=False, encoding='utf-8')
+    logging.info(f"Datos de muestra creados con {len(df)} registros")
+
+def extract_weather_data(**kwargs):
+    """
+    Extrae datos climáticos de Open-Meteo para Buenos Aires
+    """
+    ti = kwargs['ti']
+    execution_date = kwargs.get('execution_date') or kwargs.get('data_interval_start') or ti.execution_date
+    date_str = execution_date.strftime('%Y-%m-%d')
+    
+    logging.info(f"Descargando datos climáticos para: {date_str}")
+    
+    # API de Open-Meteo para Buenos Aires
+    url = "https://archive-api.open-meteo.com/v1/archive"
+    params = {
+        'latitude': -34.6132,  # Buenos Aires
+        'longitude': -58.3772,
+        'start_date': date_str,
+        'end_date': date_str,
+        'hourly': 'temperature_2m,relative_humidity_2m,precipitation,wind_speed_10m,wind_direction_10m,pressure_msl,cloudcover',
+        'timezone': 'America/Argentina/Buenos_Aires'
+    }
     
     try:
-        # Obtener credenciales desde Airflow Connections
-        conn = BaseHook.get_connection("gmail_smtp")
-        remitente = conn.login
-        contraseña = conn.password
-        servidor = conn.host
-        puerto = conn.port
+        response = requests.get(url, params=params, timeout=30)
+        response.raise_for_status()
+        data = response.json()
         
-        # Crear mensaje
-        mensaje = MIMEMultipart()
-        mensaje["From"] = remitente
-        mensaje["To"] = destinatario
-        mensaje["Subject"] = asunto
-        mensaje.attach(MIMEText(cuerpo, "html"))
+        logging.info(f"Datos climáticos descargados: {len(data['hourly']['time'])} registros")
         
-        # Adjuntar archivos
-        archivos = [dataset_path, recommendations_path]
+        # Crear directorio si no existe
+        data_dir = "/tmp/data"
+        os.makedirs(data_dir, exist_ok=True)
+
+        weather_file_path = f"{data_dir}/weather_data_{execution_date.strftime('%Y%m%d')}.json"
+        with open(weather_file_path, 'w') as f:
+            json.dump(data, f)
         
-        for archivo in archivos:
-            if os.path.exists(archivo):
-                with open(archivo, "rb") as adj:
-                    parte = MIMEBase("application", "octet-stream")
-                    parte.set_payload(adj.read())
-                    encoders.encode_base64(parte)
-                    parte.add_header("Content-Disposition", f"attachment; filename={os.path.basename(archivo)}")
-                    mensaje.attach(parte)
+        ti.xcom_push(key='weather_data', value=data)
+        ti.xcom_push(key='weather_file_path', value=weather_file_path)
         
-        # Enviar email
-        with smtplib.SMTP(servidor, puerto) as server:
-            server.starttls()
-            server.login(remitente, contraseña)
-            server.sendmail(remitente, destinatario, mensaje.as_string())
-        
-        print(f"Email report sent successfully for {execution_date}")
+        return f"Datos climáticos obtenidos: {weather_file_path}"
         
     except Exception as e:
-        print(f"Error sending email: {str(e)}")
-        raise e
+        logging.error(f"Error al obtener datos climáticos: {str(e)}")
+        raise
 
-# Definición del DAG
+def process_and_merge_data(**kwargs):
+    """
+    Procesa y combina los datos de CAMMESA con los datos climáticos
+    """
+    ti = kwargs['ti']
+    execution_date = kwargs.get('execution_date') or kwargs.get('data_interval_start') or ti.execution_date
+    date_str = execution_date.strftime('%Y%m%d')
+    
+    # Obtener rutas de archivos
+    cammesa_file_path = ti.xcom_pull(key='cammesa_file_path', task_ids='download_cammesa')
+    weather_data = ti.xcom_pull(key='weather_data', task_ids='extract_weather')
+    
+    logging.info("Procesando datos de CAMMESA...")
+    
+    # Leer datos de CAMMESA
+    try:
+        cammesa_df = pd.read_csv(cammesa_file_path, sep=';', encoding='utf-8')
+        logging.info(f"Datos CAMMESA cargados: {len(cammesa_df)} filas, columnas: {list(cammesa_df.columns)}")
+    except Exception as e:
+        logging.error(f"Error leyendo CSV de CAMMESA: {e}")
+        # Intentar con otros separadores
+        try:
+            cammesa_df = pd.read_csv(cammesa_file_path, sep=',', encoding='utf-8')
+            logging.info("Datos cargados con separador ','")
+        except:
+            cammesa_df = pd.read_csv(cammesa_file_path, encoding='utf-8')
+            logging.info("Datos cargados con separador automático")
+    
+    # Procesar fechas de CAMMESA
+    cammesa_df['fecha_dt'] = pd.to_datetime(cammesa_df['fecha'], format='%d/%m/%Y %H:%M', errors='coerce')
+    cammesa_df = cammesa_df.dropna(subset=['fecha_dt'])
+    cammesa_df = cammesa_df.sort_values('fecha_dt')
+    
+    # Limpiar columnas numéricas (reemplazar comas por puntos)
+    numeric_cols = ['Prevista', 'Semana Ant', 'Ayer', 'Hoy', 'Tem. Prevista', 'Tem. Semana Ant.', 'Tem. Ayer', 'Tem. Hoy']
+    for col in numeric_cols:
+        if col in cammesa_df.columns:
+            cammesa_df[col] = cammesa_df[col].astype(str).str.replace(',', '.')
+            cammesa_df[col] = pd.to_numeric(cammesa_df[col], errors='coerce')
+    
+    logging.info("Procesando datos climáticos...")
+    
+    # Procesar datos climáticos
+    weather_df = pd.DataFrame({
+        'datetime': pd.to_datetime(weather_data['hourly']['time']),
+        'temperature': weather_data['hourly']['temperature_2m'],
+        'humidity': weather_data['hourly']['relative_humidity_2m'],
+        'precipitation': weather_data['hourly']['precipitation'],
+        'wind_speed': weather_data['hourly']['wind_speed_10m'],
+        'wind_direction': weather_data['hourly']['wind_direction_10m'],
+        'pressure': weather_data['hourly']['pressure_msl'],
+        'cloudcover': weather_data['hourly']['cloudcover']
+    })
+    
+    logging.info(f"Datos climáticos procesados: {len(weather_df)} registros")
+    
+    # Agregar características temporales a ambos datasets
+    cammesa_df['year'] = cammesa_df['fecha_dt'].dt.year
+    cammesa_df['month'] = cammesa_df['fecha_dt'].dt.month
+    cammesa_df['day'] = cammesa_df['fecha_dt'].dt.day
+    cammesa_df['hour'] = cammesa_df['fecha_dt'].dt.hour
+    cammesa_df['minute'] = cammesa_df['fecha_dt'].dt.minute
+    cammesa_df['day_of_week'] = cammesa_df['fecha_dt'].dt.dayofweek
+    cammesa_df['is_weekend'] = cammesa_df['day_of_week'].isin([5, 6]).astype(int)
+    cammesa_df['hour_sin'] = np.sin(2 * np.pi * cammesa_df['hour'] / 24)
+    cammesa_df['hour_cos'] = np.cos(2 * np.pi * cammesa_df['hour'] / 24)
+    cammesa_df['month_sin'] = np.sin(2 * np.pi * cammesa_df['month'] / 12)
+    cammesa_df['month_cos'] = np.cos(2 * np.pi * cammesa_df['month'] / 12)
+    
+    # Interpolar datos climáticos horarios a intervalos de 5 minutos
+    weather_df = weather_df.set_index('datetime')
+    
+    # Crear índice cada 5 minutos para el día
+    start_time = execution_date.replace(hour=0, minute=0, second=0, microsecond=0)
+    end_time = start_time + timedelta(days=1)
+    time_index = pd.date_range(start=start_time, end=end_time, freq='5min')[:-1]  # Excluir último punto
+    
+    # Interpolar datos climáticos
+    weather_interp = weather_df.reindex(weather_df.index.union(time_index)).interpolate(method='time')
+    weather_interp = weather_interp.reindex(time_index)
+    weather_interp = weather_interp.reset_index()
+    weather_interp.rename(columns={'index': 'datetime'}, inplace=True)
+    
+    # Combinar datos basándose en timestamp más cercano
+    def find_closest_weather(dt):
+        idx = weather_interp['datetime'].sub(dt).abs().idxmin()
+        return weather_interp.iloc[idx]
+    
+    # Aplicar merge
+    weather_matches = cammesa_df['fecha_dt'].apply(find_closest_weather)
+    weather_matches_df = pd.DataFrame(list(weather_matches))
+    weather_matches_df.index = cammesa_df.index
+    
+    # Combinar todos los datos
+    final_df = pd.concat([cammesa_df, weather_matches_df.drop('datetime', axis=1)], axis=1)
+    
+    # Guardar dataset final
+    output_path = f"/opt/airflow/data/energy_weather_dataset_{date_str}.csv"
+    final_df.to_csv(output_path, index=False)
+    
+    logging.info(f"Dataset final creado: {output_path}")
+    logging.info(f"Registros: {len(final_df)}, Columnas: {len(final_df.columns)}")
+    logging.info(f"Columnas finales: {list(final_df.columns)}")
+    
+    ti.xcom_push(key='final_dataset_path', value=output_path)
+    return f"Dataset procesado: {output_path}"
+
+def save_to_master_dataset(**kwargs):
+    """
+    Agrega los datos procesados al dataset maestro histórico
+    """
+    ti = kwargs['ti']
+    daily_dataset_path = ti.xcom_pull(key='final_dataset_path', task_ids='process_merge_data')
+    
+    # Leer datos del día
+    daily_df = pd.read_csv(daily_dataset_path)
+    
+    # Ruta del dataset maestro
+    master_dataset_path = "/opt/airflow/data/master_energy_dataset.csv"
+    
+    if os.path.exists(master_dataset_path):
+        # Cargar dataset existente
+        master_df = pd.read_csv(master_dataset_path)
+        
+        # Combinar y eliminar duplicados
+        combined_df = pd.concat([master_df, daily_df], ignore_index=True)
+        if 'fecha_dt' in combined_df.columns:
+            combined_df = combined_df.drop_duplicates(subset=['fecha_dt'])
+        
+        # Ordenar por fecha
+        combined_df = combined_df.sort_values('fecha_dt')
+        combined_df.to_csv(master_dataset_path, index=False)
+        
+        logging.info(f"Dataset maestro actualizado: {len(combined_df)} registros totales")
+    else:
+        # Crear nuevo dataset maestro
+        daily_df.to_csv(master_dataset_path, index=False)
+        logging.info(f"Dataset maestro creado: {len(daily_df)} registros")
+    
+    return f"Dataset maestro actualizado: {master_dataset_path}"
+
+# DAG principal
 with DAG(
-    dag_id='music_weather_recommendation',
-    description='DAG para sistema de recomendación musical basado en condiciones climáticas',
+    'energy_demand_pipeline',
     default_args=default_args,
-    schedule=None,  
+    description='Pipeline completo para datos de demanda energética y clima',
+    schedule=None,  # Sin programación automática por ahora
     catchup=False,
-    tags=['music', 'weather', 'recommendation', 'spotify']
+    max_active_runs=1,
+    tags=['cammesa', 'energy', 'weather', 'ml']
 ) as dag:
-
-    fetch_weather = PythonOperator(
-        task_id='fetch_weather_data',
-        python_callable=fetch_weather_data,
+    
+    # Descargar datos de CAMMESA
+    download_cammesa_task = PythonOperator(
+        task_id='download_cammesa',
+        python_callable=download_cammesa_data,
+        execution_timeout=timedelta(minutes=10)
     )
-
-    fetch_spotify = PythonOperator(
-        task_id='fetch_spotify_playlist',
-        python_callable=fetch_spotify_playlist,
+    
+    # Extraer datos climáticos
+    extract_weather_task = PythonOperator(
+        task_id='extract_weather',
+        python_callable=extract_weather_data,
+        execution_timeout=timedelta(minutes=5)
     )
-
-    fetch_audio = PythonOperator(
-        task_id='fetch_audio_features',
-        python_callable=fetch_audio_features,
+    
+    # Procesar y combinar datos
+    process_merge_task = PythonOperator(
+        task_id='process_merge_data',
+        python_callable=process_and_merge_data,
+        execution_timeout=timedelta(minutes=10)
     )
-
-    merge_data = PythonOperator(
-        task_id='merge_and_transform_data',
-        python_callable=merge_and_transform_data,
+    
+    # Guardar en dataset maestro
+    save_master_task = PythonOperator(
+        task_id='save_master_dataset',
+        python_callable=save_to_master_dataset,
+        execution_timeout=timedelta(minutes=5)
     )
-
-    generate_report = PythonOperator(
-        task_id='generate_recommendations_report',
-        python_callable=generate_recommendations_report,
-    )
-
-    send_email = PythonOperator(
-        task_id='send_email_report',
-        python_callable=send_email_report,
-    )
-
+    
     # Definir dependencias
-    [fetch_weather, fetch_spotify] >> fetch_audio >> merge_data >> generate_report >> send_email
+    [download_cammesa_task, extract_weather_task] >> process_merge_task >> save_master_task
