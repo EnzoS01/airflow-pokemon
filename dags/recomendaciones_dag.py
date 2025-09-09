@@ -34,82 +34,24 @@ def download_cammesa_data(**kwargs):
     out_csv = f"{data_dir}/cammesa_data_{file_date_str}.csv"
 
     url = "https://api.cammesa.com/demanda-svc/demanda/ObtieneDemandaYTemperaturaRegion"
-    params = {"id_region": "425"}  # ajustá con el id de región que necesites
+    params = {"id_region": "425"}  # id correspondiente al Gran Buenos Aires
     headers = {
         "User-Agent": "Mozilla/5.0",
         "Accept": "application/json, text/plain, */*",
         "Referer": "https://api.cammesa.com/",
-    }
+    } # headers necesarios
 
     r = requests.get(url, params=params, headers=headers, timeout=60)
     r.raise_for_status()
 
-    try:
-        # Caso A: devuelve JSON
-        data = r.json()
-        df = pd.DataFrame(data)   # según estructura real, capaz necesites data['series'] o similar
-        df.to_csv(out_csv, sep=";", index=False, encoding="utf-8")
-        logging.info(f"Guardado CSV a partir de JSON en {out_csv}")
-    except ValueError:
-        # Caso B: devuelve CSV directo
-        with open(out_csv, "wb") as f:
-            f.write(r.content)
-        logging.info(f"Guardado CSV directo en {out_csv}")
+    #devuelve CSV directo
+    with open(out_csv, "wb") as f:
+        f.write(r.content)
+    logging.info(f"Guardado CSV directo en {out_csv}")
 
     ti.xcom_push(key='cammesa_file_path', value=out_csv)
     ti.xcom_push(key='download_date', value=execution_date.strftime('%Y-%m-%d'))
     return f"Datos CAMMESA: {out_csv}"
-
-def create_sample_cammesa_data(execution_date, ti, file_path):
-    """
-    Crea datos de muestra realistas basados en el formato de CAMMESA
-    """
-    date_formatted = execution_date.strftime('%d/%m/%Y')
-    
-    # Generar datos cada 5 minutos para un día completo
-    times = []
-    demands = []
-    temps = []
-    
-    base_demand = 20000  # MW base
-    base_temp = 15  # Temperatura base
-    
-    for hour in range(24):
-        for minute in range(0, 60, 5):  # cada 5 minutos
-            time_str = f"{date_formatted} {hour:02d}:{minute:02d}"
-            times.append(time_str)
-            
-            # Simular demanda con patrón diario
-            hour_factor = 0.8 + 0.4 * np.sin(2 * np.pi * (hour - 6) / 24)
-            demand = int(base_demand * hour_factor + np.random.normal(0, 500))
-            demands.append(demand)
-            
-            # Simular temperatura
-            temp_variation = 5 * np.sin(2 * np.pi * (hour - 12) / 24)
-            temp = round(base_temp + temp_variation + np.random.normal(0, 1), 1)
-            temps.append(temp)
-    
-    # Crear DataFrame con formato CAMMESA
-    df = pd.DataFrame({
-        'fecha': times,
-        'Prevista': [demands[i] if i % 4 == 0 else '' for i in range(len(demands))],
-        'Semana Ant': [demands[i] - np.random.randint(-500, 500) if i % 3 == 0 else '' for i in range(len(demands))],
-        'Ayer': [demands[i] - np.random.randint(-300, 300) if i % 2 == 0 else '' for i in range(len(demands))],
-        'Hoy': demands,
-        'Tem. Prevista': [temps[i] if i % 4 == 0 else '' for i in range(len(temps))],
-        'Tem. Semana Ant.': [temps[i] + np.random.normal(0, 2) if i % 3 == 0 else '' for i in range(len(temps))],
-        'Tem. Ayer': [temps[i] + np.random.normal(0, 1) if i % 2 == 0 else '' for i in range(len(temps))],
-        'Tem. Hoy': temps
-    })
-    
-    # Guardar como CSV con formato correcto
-    df.to_csv(file_path, sep=';', index=False, encoding='utf-8')
-    logging.info(f"Datos de muestra creados con {len(df)} registros")
-
-import os
-import json
-import logging
-import requests
 
 def extract_weather_data(**kwargs):
     """
