@@ -8,7 +8,6 @@ import json
 import os
 import logging
 import numpy as np
-from urllib.parse import urlencode
 
 default_args = {
     'owner': 'airflow',
@@ -124,12 +123,6 @@ def process_and_merge_data(**kwargs):
     interpolando datos horarios a intervalos de 5 minutos y agregando
     características temporales.
     """
-    import pandas as pd
-    import numpy as np
-    import logging
-    import os
-    from datetime import timedelta
-
     ti = kwargs['ti']
     execution_date = execution_date.tz_convert(None) if execution_date.tzinfo else execution_date
     date_str = execution_date.strftime('%Y%m%d')
