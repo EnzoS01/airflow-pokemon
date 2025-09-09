@@ -103,8 +103,7 @@ def extract_weather_data(**kwargs):
         logging.info(f"Datos climáticos descargados: {registros} registros")
         
         # Guardar JSON
-        data_dir = "/tmp/data"
-        os.makedirs(data_dir, exist_ok=True)
+        data_dir = get_data_dir()
         weather_file_path = f"{data_dir}/weather_data_{execution_date.strftime('%Y%m%d')}.json"
         with open(weather_file_path, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
