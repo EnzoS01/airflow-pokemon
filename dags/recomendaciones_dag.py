@@ -126,7 +126,7 @@ def extract_weather_data(**kwargs):
         "start_date": date_str,
         "end_date": date_str,
         "hourly": "temperature_2m,relative_humidity_2m,precipitation,wind_speed_10m,wind_direction_10m,pressure_msl,cloudcover",
-        "timezone": "America/Argentina/Buenos_Aires"  # Especificar el huso horario correcto
+        "timezone": "auto"  # Especificar el huso horario correcto
     }
     
     try:
@@ -169,12 +169,10 @@ def extract_weather_data(**kwargs):
     except Exception as e:
         logging.error(f"Error al obtener datos climáticos: {str(e)}")
         raise
-
 def process_and_merge_data(**kwargs):
     import pandas as pd
     import os
     import logging
-    from pytz import timezone
 
     ti = kwargs["ti"]
     execution_date = (
@@ -182,7 +180,8 @@ def process_and_merge_data(**kwargs):
         or kwargs.get('data_interval_start')
         or ti.execution_date
     )
-    
+
+    # --- Recuperar XComs ---
     weather_data = ti.xcom_pull(task_ids="extract_weather", key="weather_data")
     if not weather_data:
         raise ValueError("No se encontraron datos climáticos en XCom.")
@@ -193,7 +192,7 @@ def process_and_merge_data(**kwargs):
 
     # --- Procesar datos de CAMMESA ---
     cammesa_df = pd.read_csv(cammesa_file_path, sep=';')
-    
+
     if 'Hoy' in cammesa_df.columns:
         cammesa_df['Hoy'] = (
             cammesa_df['Hoy'].astype(str)
@@ -202,78 +201,58 @@ def process_and_merge_data(**kwargs):
         )
         cammesa_df['Hoy'] = pd.to_numeric(cammesa_df['Hoy'], errors='coerce')
 
+    # Fechas vienen en hora local ya (ARG)
     cammesa_df["fecha_dt"] = pd.to_datetime(cammesa_df["fecha"], errors="coerce")
     cammesa_df = cammesa_df.dropna(subset=["fecha_dt"])
     cammesa_df = cammesa_df[cammesa_df["fecha_dt"].dt.minute == 0]
-    
-    # FILTRAR: Solo las primeras 24 horas (eliminar la hora 00:00 del día siguiente)
-    cammesa_df = cammesa_df.sort_values("fecha_dt")
-    cammesa_df = cammesa_df.head(24)  # Tomar solo las primeras 24 horas
-    
-    argentina_tz = timezone('America/Argentina/Buenos_Aires')
-    cammesa_df["fecha_dt"] = cammesa_df["fecha_dt"].dt.tz_localize(argentina_tz)
-    cammesa_df["hour_only"] = cammesa_df["fecha_dt"].dt.tz_convert(argentina_tz).dt.floor("H")
-    cammesa_df["hour_only"] = cammesa_df["hour_only"].dt.tz_localize(None)
 
-    # --- Procesar datos de Open-Meteo ---
+    # Tomar solo 24 horas del día
+    cammesa_df = cammesa_df.sort_values("fecha_dt").head(24)
+    cammesa_df["hour_only"] = cammesa_df["fecha_dt"].dt.floor("H")
+
+    # --- Procesar datos de Weather ---
     weather_df = pd.DataFrame(weather_data)
-    weather_df["datetime_utc"] = pd.to_datetime(weather_df["time"], utc=True)
-    weather_df["datetime_arg"] = weather_df["datetime_utc"].dt.tz_convert(argentina_tz)
+
+    # Ojo: Open-Meteo con timezone=auto ya devuelve en ARG
+    weather_df["datetime_arg"] = pd.to_datetime(weather_df["time"], errors="coerce")
     weather_df["hour_only"] = weather_df["datetime_arg"].dt.floor("H")
-    weather_df["hour_only"] = weather_df["hour_only"].dt.tz_localize(None)
 
-    # DEBUG detallado
-    logging.info(f"Total horas CAMMESA después de filtrar: {len(cammesa_df)}")
-    logging.info(f"Total horas Weather: {len(weather_df)}")
-    logging.info(f"Rango CAMMESA: {cammesa_df['hour_only'].min()} to {cammesa_df['hour_only'].max()}")
-    logging.info(f"Rango Weather: {weather_df['hour_only'].min()} to {weather_df['hour_only'].max()}")
-    
-    # Verificar que las horas coincidan exactamente
-    cammesa_hours = set(cammesa_df['hour_only'].dt.strftime('%Y-%m-%d %H:%M:%S'))
-    weather_hours = set(weather_df['hour_only'].dt.strftime('%Y-%m-%d %H:%M:%S'))
-    
-    missing_in_weather = cammesa_hours - weather_hours
-    missing_in_cammesa = weather_hours - cammesa_hours
-    
-    if missing_in_weather:
-        logging.warning(f"Horas en CAMMESA pero no en Weather: {missing_in_weather}")
-    if missing_in_cammesa:
-        logging.warning(f"Horas en Weather pero no en CAMMESA: {missing_in_cammesa}")
+    # --- Logs para debugging ---
+    logging.info(f"Horas CAMMESA ({len(cammesa_df)}): "
+                 f"{cammesa_df['hour_only'].min()} -> {cammesa_df['hour_only'].max()}")
+    logging.info(f"Horas Weather ({len(weather_df)}): "
+                 f"{weather_df['hour_only'].min()} -> {weather_df['hour_only'].max()}")
 
-    # --- Merge con INNER JOIN para asegurar coincidencia exacta ---
+    # --- Merge ---
     merged_df = pd.merge(
         cammesa_df[["hour_only", "Hoy", "fecha_dt"]],
-        weather_df.drop(columns=["time", "datetime_utc", "datetime_arg"]),
+        weather_df.drop(columns=["time", "datetime_arg"]),
         on="hour_only",
-        how="inner"  # Cambiado a inner para solo horas que coinciden
+        how="inner"
     )
 
-    logging.info(f"Registros después del merge: {len(merged_df)}")
-    
-    if len(merged_df) == 0:
+    if merged_df.empty:
         raise ValueError("No hubo coincidencia entre horas de CAMMESA y Weather")
-    
-    # Renombrar columnas
+
     merged_df = merged_df.rename(columns={
         "hour_only": "fecha",
         "fecha_dt": "fecha_original_cammesa"
     })
 
     column_order = ["fecha", "fecha_original_cammesa", "Hoy"] + \
-                  [col for col in merged_df.columns if col not in ["fecha", "fecha_original_cammesa", "Hoy"]]
-    
+                   [c for c in merged_df.columns if c not in ["fecha", "fecha_original_cammesa", "Hoy"]]
     merged_df = merged_df[column_order]
 
+    # Guardar resultado
     output_file = f"/tmp/data/energy_weather_dataset_{execution_date.strftime('%Y%m%d')}.csv"
     os.makedirs(os.path.dirname(output_file), exist_ok=True)
     merged_df.to_csv(output_file, index=False, encoding="utf-8")
 
-    logging.info(f"Dataset final guardado en {output_file}")
-    logging.info(f"Registros finales: {len(merged_df)}")
-    
+    logging.info(f"Dataset final guardado en {output_file} con {len(merged_df)} registros")
+
     ti.xcom_push(key='final_dataset_path', value=output_file)
-    
     return output_file
+
 
 def save_to_master_dataset(**kwargs):
     """
