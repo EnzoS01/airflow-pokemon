@@ -255,12 +255,12 @@ def process_and_merge_data(**kwargs):
     
     # Renombrar columnas
     merged_df = merged_df.rename(columns={
-        "hour_only": "fecha_hora",
+        "hour_only": "fecha",
         "fecha_dt": "fecha_original_cammesa"
     })
 
-    column_order = ["fecha_hora", "fecha_original_cammesa", "Hoy"] + \
-                  [col for col in merged_df.columns if col not in ["fecha_hora", "fecha_original_cammesa", "Hoy"]]
+    column_order = ["fecha", "fecha_original_cammesa", "Hoy"] + \
+                  [col for col in merged_df.columns if col not in ["fecha", "fecha_original_cammesa", "Hoy"]]
     
     merged_df = merged_df[column_order]
 
