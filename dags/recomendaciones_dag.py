@@ -279,35 +279,50 @@ def save_to_master_dataset(**kwargs):
     """
     Agrega los datos procesados al dataset maestro histórico
     """
+    import pandas as pd
+    import os
+    import logging
+
     ti = kwargs['ti']
     daily_dataset_path = ti.xcom_pull(key='final_dataset_path', task_ids='process_merge_data')
     
     # Leer datos del día
     daily_df = pd.read_csv(daily_dataset_path)
+
+    # Asegurarse de que la columna fecha exista
+    if 'fecha' not in daily_df.columns:
+        raise ValueError(f"No se encontró la columna 'fecha' en daily_df. Columnas: {daily_df.columns.tolist()}")
     
+    daily_df['fecha'] = pd.to_datetime(daily_df['fecha'], errors='coerce')
+
     # Ruta del dataset maestro
-    master_dataset_path = "/opt/airflow/data/master_energy_dataset.csv"
+    master_dataset_path = "/tmp/data/master_energy_dataset.csv"
     
     if os.path.exists(master_dataset_path):
-        # Cargar dataset existente
         master_df = pd.read_csv(master_dataset_path)
         
-        # Combinar y eliminar duplicados
+        # Asegurarse que master_df tenga fecha
+        if 'fecha' not in master_df.columns:
+            master_df['fecha'] = pd.to_datetime(master_df['fecha'], errors='coerce')
+        
+        # Combinar, eliminar duplicados y ordenar
         combined_df = pd.concat([master_df, daily_df], ignore_index=True)
-        if 'fecha_dt' in combined_df.columns:
-            combined_df = combined_df.drop_duplicates(subset=['fecha_dt'])
-        
-        # Ordenar por fecha
-        combined_df = combined_df.sort_values('fecha_dt')
+        combined_df.drop_duplicates(subset=['fecha'], inplace=True)
+        if 'fecha' in combined_df.columns:
+            combined_df['fecha'] = pd.to_datetime(combined_df['fecha'], errors='coerce')
+            combined_df = combined_df.drop_duplicates(subset=['fecha'])
+            combined_df = combined_df.sort_values('fecha')
+        combined_df.sort_values('fecha', inplace=True)
         combined_df.to_csv(master_dataset_path, index=False)
-        
         logging.info(f"Dataset maestro actualizado: {len(combined_df)} registros totales")
     else:
-        # Crear nuevo dataset maestro
+        # Crear nuevo dataset maestro y asegurarse que fecha sea datetime
+        daily_df.sort_values('fecha', inplace=True)
         daily_df.to_csv(master_dataset_path, index=False)
         logging.info(f"Dataset maestro creado: {len(daily_df)} registros")
     
     return f"Dataset maestro actualizado: {master_dataset_path}"
+
 
 # DAG principal
 with DAG(
