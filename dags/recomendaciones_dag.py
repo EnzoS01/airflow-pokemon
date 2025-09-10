@@ -40,14 +40,61 @@ def download_cammesa_data(**kwargs):
         "Referer": "https://api.cammesa.com/",
     } # headers necesarios
 
-    r = requests.get(url, params=params, headers=headers, timeout=60)
+    r = requests.get(url, params=params, headers=headers, timeout=60, verify=False)
     r.raise_for_status()
 
-    #devuelve CSV directo
-    with open(out_csv, "wb") as f:
-        f.write(r.content)
-    logging.info(f"Guardado CSV directo en {out_csv}")
+    max_retries = 5
+    for attempt in range(max_retries):
+        try:
+            r = requests.get(url, params=params, headers=headers, timeout=60, verify=False)
+            r.raise_for_status()
+            break
+        except requests.exceptions.SSLError as e:
+            logging.warning(f"SSL error en intento {attempt+1}/{max_retries}: {e}")
+            if attempt < max_retries - 1:
+                time.sleep(5 * (attempt+1))  # backoff exponencial
+            else:
+                raise
 
+    # La API devuelve JSON, no CSV directo
+    data = r.json()
+
+    # Convertir JSON a DataFrame
+    df = pd.DataFrame(data)
+
+    # Renombrar columnas para que coincidan con el formato del CSV manual
+    column_mapping = {
+        'fecha': 'fecha',
+        'demPrevista': 'Prevista',
+        'demSemanaAnt': 'Semana Ant',
+        'demAyer': 'Ayer',
+        'demHoy': 'Hoy',
+        'tempPrevista': 'Tem. Prevista',
+        'tempSemanaAnt': 'Tem. Semana Ant.',
+        'tempAyer': 'Tem. Ayer',
+        'tempHoy': 'Tem. Hoy'
+    }
+
+    df = df.rename(columns=column_mapping)
+    # Asegurar que tengamos todas las columnas esperadas
+    expected_columns = ['fecha', 'Prevista', 'Semana Ant', 'Ayer', 'Hoy', 
+                       'Tem. Prevista', 'Tem. Semana Ant.', 'Tem. Ayer', 'Tem. Hoy']
+    
+    for col in expected_columns:
+        if col not in df.columns:
+            df[col] = None  # Añadir columnas faltantes con valores nulos
+    
+    # Reordenar columnas
+    df = df[expected_columns]
+    
+    # Formatear fecha correctamente (de ISO a formato esperado)
+    df['fecha'] = pd.to_datetime(df['fecha']).dt.strftime('%Y-%m-%d %H:%M:%S')
+    
+    # Guardar como CSV con el formato correcto
+    df.to_csv(out_csv, index=False, sep=';', encoding='utf-8')
+    
+    logging.info(f"Guardado CSV formateado en {out_csv}")
+    logging.info(f"Registros: {len(df)}, Columnas: {list(df.columns)}")
     ti.xcom_push(key='cammesa_file_path', value=out_csv)
     ti.xcom_push(key='download_date', value=execution_date.strftime('%Y-%m-%d'))
     return f"Datos CAMMESA: {out_csv}"
@@ -118,105 +165,52 @@ def extract_weather_data(**kwargs):
         raise
 
 def process_and_merge_data(**kwargs):
-    """
-    Procesa y combina los datos de CAMMESA con los datos climáticos,
-    interpolando datos horarios a intervalos de 5 minutos y agregando
-    características temporales.
-    """
-    ti = kwargs['ti']
-    execution_date = execution_date.tz_convert(None) if execution_date.tzinfo else execution_date
-    date_str = execution_date.strftime('%Y%m%d')
+    import pandas as pd
+    import os
 
-    # Obtener rutas de archivos y datos desde XCom
-    cammesa_file_path = ti.xcom_pull(key='cammesa_file_path', task_ids='download_cammesa')
-    weather_data = ti.xcom_pull(key='weather_data', task_ids='extract_weather')
+    ti = kwargs["ti"]
+    weather_data = ti.xcom_pull(task_ids="extract_weather_data",key="weather_data")
+    if not weather_data:
+        raise ValueError("No se encontraron datos climáticos en XCom.")
 
-    logging.info("Procesando datos de CAMMESA...")
+    # --- Procesar datos de CAMMESA ---
+    cammesa_file = "/tmp/data/cammesa_data.csv"
+    cammesa_df = pd.read_csv(cammesa_file)
 
-    # Leer CSV de CAMMESA
-    try:
-        cammesa_df = pd.read_csv(cammesa_file_path, sep=';', encoding='utf-8')
-    except Exception:
-        cammesa_df = pd.read_csv(cammesa_file_path, sep=',', encoding='utf-8')
-    cammesa_df = cammesa_df.dropna(subset=['fecha'])
-    cammesa_df['fecha_dt'] = pd.to_datetime(cammesa_df['fecha'], format='%d/%m/%Y %H:%M', errors='coerce')
-    cammesa_df = cammesa_df.dropna(subset=['fecha_dt'])
-    cammesa_df = cammesa_df.sort_values('fecha_dt')
+    # Solo quedarnos con fecha + Hoy
+    cammesa_df = cammesa_df[["fecha", "Hoy"]]
+    cammesa_df["fecha_dt"] = pd.to_datetime(cammesa_df["fecha"], errors="coerce")
+    cammesa_df = cammesa_df.dropna(subset=["fecha_dt"])
+    cammesa_df["hour_only"] = cammesa_df["fecha_dt"].dt.floor("H")
 
-    # Limpiar columnas numéricas
-    numeric_cols = ['Prevista', 'Semana Ant', 'Ayer', 'Hoy',
-                    'Tem. Prevista', 'Tem. Semana Ant.', 'Tem. Ayer', 'Tem. Hoy']
-    for col in numeric_cols:
-        if col in cammesa_df.columns:
-            cammesa_df[col] = cammesa_df[col].astype(str).str.replace(',', '.')
-            cammesa_df[col] = pd.to_numeric(cammesa_df[col], errors='coerce')
+    # --- Procesar datos de Open-Meteo ---
+    weather_df = pd.DataFrame(weather_data)
+    weather_df["datetime"] = pd.to_datetime(weather_df["time"], utc=True)
+    weather_df["datetime"] = weather_df["datetime"].dt.tz_convert("America/Argentina/Buenos_Aires")
+    weather_df["hour_only"] = weather_df["datetime"].dt.floor("H")
 
-    logging.info(f"Datos CAMMESA cargados: {len(cammesa_df)} filas, columnas: {list(cammesa_df.columns)}")
+    # Quitar timezone para que coincida con CAMMESA
+    weather_df["hour_only"] = weather_df["hour_only"].dt.tz_localize(None)
 
-    # Asegurarse que las fechas sean tz-naive para evitar errores
-    cammesa_df['fecha_dt'] = cammesa_df['fecha_dt'].dt.tz_localize(None)
+    # --- Merge ---
+    merged_df = pd.merge(
+        cammesa_df[["hour_only", "Hoy"]],
+        weather_df.drop(columns=["time"]),
+        left_on="hour_only",
+        right_on="hour_only",
+        how="inner"
+    )
 
-    logging.info("Procesando datos climáticos...")
+    # Renombrar fecha final
+    merged_df = merged_df.rename(columns={"hour_only": "fecha"})
 
-    # Procesar datos climáticos
-    weather_df = pd.DataFrame({
-        'datetime': pd.to_datetime(weather_data['time']).tz_localize(None),
-        'temperature': weather_data['temperature_2m'],
-        'humidity': weather_data['relative_humidity_2m'],
-        'precipitation': weather_data['precipitation'],
-        'wind_speed': weather_data['wind_speed_10m'],
-        'wind_direction': weather_data['wind_direction_10m'],
-        'pressure': weather_data['pressure_msl'],
-        'cloudcover': weather_data['cloudcover']
-    }).set_index('datetime')
+    # --- Guardar dataset final ---
+    output_file = "/tmp/data/energy_weather_dataset.csv"
+    os.makedirs(os.path.dirname(output_file), exist_ok=True)
+    merged_df.to_csv(output_file, index=False, encoding="utf-8")
 
-    # Crear índice cada 5 minutos para el día
-    start_time = execution_date.replace(hour=0, minute=0, second=0, microsecond=0)
-    time_index = pd.date_range(start=start_time, end=start_time + timedelta(days=1) - timedelta(minutes=5), freq='5min')
-
-    # Interpolar datos climáticos
-    weather_interp = weather_df.reindex(weather_df.index.union(time_index))
-    weather_interp = weather_interp.sort_index()
-    weather_interp = weather_interp.interpolate(method='time')
-    weather_interp = weather_interp.reindex(time_index).reset_index().rename(columns={'index': 'datetime'})
-
-    # Agregar características temporales a CAMMESA
-    cammesa_df['year'] = cammesa_df['fecha_dt'].dt.year
-    cammesa_df['month'] = cammesa_df['fecha_dt'].dt.month
-    cammesa_df['day'] = cammesa_df['fecha_dt'].dt.day
-    cammesa_df['hour'] = cammesa_df['fecha_dt'].dt.hour
-    cammesa_df['minute'] = cammesa_df['fecha_dt'].dt.minute
-    cammesa_df['day_of_week'] = cammesa_df['fecha_dt'].dt.dayofweek
-    cammesa_df['is_weekend'] = cammesa_df['day_of_week'].isin([5, 6]).astype(int)
-    cammesa_df['hour_sin'] = np.sin(2 * np.pi * cammesa_df['hour'] / 24)
-    cammesa_df['hour_cos'] = np.cos(2 * np.pi * cammesa_df['hour'] / 24)
-    cammesa_df['month_sin'] = np.sin(2 * np.pi * cammesa_df['month'] / 12)
-    cammesa_df['month_cos'] = np.cos(2 * np.pi * cammesa_df['month'] / 12)
-
-    # Función para encontrar el clima más cercano
-    def find_closest_weather(dt):
-        idx = weather_interp['datetime'].sub(dt).abs().idxmin()
-        return weather_interp.iloc[idx]
-
-    weather_matches = cammesa_df['fecha_dt'].apply(find_closest_weather)
-    weather_matches_df = pd.DataFrame(list(weather_matches))
-    weather_matches_df.index = cammesa_df.index
-
-    # Combinar datasets
-    final_df = pd.concat([cammesa_df, weather_matches_df.drop('datetime', axis=1)], axis=1)
-
-    # Guardar dataset final
-    output_path = f"/opt/airflow/data/energy_weather_dataset_{date_str}.csv"
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    final_df.to_csv(output_path, index=False)
-
-    logging.info(f"Dataset final creado: {output_path}")
-    logging.info(f"Registros: {len(final_df)}, Columnas: {len(final_df.columns)}")
-    logging.info(f"Columnas finales: {list(final_df.columns)}")
-
-    # XCom
-    ti.xcom_push(key='final_dataset_path', value=output_path)
-    return f"Dataset procesado: {output_path}"
+    print(f"Dataset final guardado en {output_file}")
+    return output_file
 
 
 
