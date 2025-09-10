@@ -8,6 +8,7 @@ import json
 import os
 import logging
 import numpy as np
+from pytz import timezone
 
 default_args = {
     'owner': 'airflow',
@@ -102,6 +103,7 @@ def download_cammesa_data(**kwargs):
 def extract_weather_data(**kwargs):
     """
     Extrae datos climáticos de Open-Meteo (forecast) para Buenos Aires.
+    Ajustado para coincidir con el huso horario de Argentina.
     """
     ti = kwargs['ti']
     execution_date = (
@@ -109,9 +111,13 @@ def extract_weather_data(**kwargs):
         or kwargs.get('data_interval_start')
         or ti.execution_date
     )
-    date_str = execution_date.strftime('%Y-%m-%d')  # Hoy
     
-    logging.info(f"Descargando datos climáticos para: {date_str}")
+    # Convertir a huso horario de Argentina
+    argentina_tz = timezone('America/Argentina/Buenos_Aires')
+    execution_date_arg = execution_date.astimezone(argentina_tz)
+    date_str = execution_date_arg.strftime('%Y-%m-%d')
+    
+    logging.info(f"Descargando datos climáticos para: {date_str} (huso Argentina)")
     
     url = "https://api.open-meteo.com/v1/forecast"
     params = {
@@ -120,7 +126,7 @@ def extract_weather_data(**kwargs):
         "start_date": date_str,
         "end_date": date_str,
         "hourly": "temperature_2m,relative_humidity_2m,precipitation,wind_speed_10m,wind_direction_10m,pressure_msl,cloudcover",
-        "timezone": "auto"
+        "timezone": "America/Argentina/Buenos_Aires"  # Especificar el huso horario correcto
     }
     
     try:
@@ -128,29 +134,29 @@ def extract_weather_data(**kwargs):
         response.raise_for_status()
         data = response.json()
         
-        # Variables por defecto si no vienen en el JSON
+        # Procesamiento de datos (mantener igual)
         hourly = data.get("hourly", {})
         keys = ["time", "temperature_2m", "relative_humidity_2m",
                 "precipitation", "wind_speed_10m", "wind_direction_10m",
                 "pressure_msl", "cloudcover"]
         
-        # Asegurar que existan todas las claves
         for key in keys:
             if key not in hourly:
                 logging.warning(f"'{key}' no está en la respuesta, se llena con NaN")
                 hourly[key] = [np.nan] * len(hourly.get("time", []))
         
-        # Crear DataFrame con DatetimeIndex
+        # Crear DataFrame con DatetimeIndex en huso horario de Argentina
         weather_df = pd.DataFrame(hourly)
         weather_df['time'] = pd.to_datetime(weather_df['time'])
         weather_df = weather_df.set_index('time')
         
         registros = len(weather_df)
         logging.info(f"Datos climáticos descargados: {registros} registros")
+        logging.info(f"Rango horario clima: {weather_df.index.min()} to {weather_df.index.max()}")
         
         # Guardar JSON
         data_dir = get_data_dir()
-        weather_file_path = f"{data_dir}/weather_data_{execution_date.strftime('%Y%m%d')}.json"
+        weather_file_path = f"{data_dir}/weather_data_{execution_date_arg.strftime('%Y%m%d')}.json"
         with open(weather_file_path, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
         
@@ -165,6 +171,10 @@ def extract_weather_data(**kwargs):
         raise
 
 def process_and_merge_data(**kwargs):
+    import pandas as pd
+    import os
+    import logging
+    from pytz import timezone
 
     ti = kwargs["ti"]
     execution_date = (
@@ -173,12 +183,10 @@ def process_and_merge_data(**kwargs):
         or ti.execution_date
     )
     
-    # Obtener datos climáticos desde XCom
     weather_data = ti.xcom_pull(task_ids="extract_weather", key="weather_data")
     if not weather_data:
         raise ValueError("No se encontraron datos climáticos en XCom.")
 
-    # Obtener ruta del archivo CAMMESA desde XCom
     cammesa_file_path = ti.xcom_pull(task_ids="download_cammesa", key="cammesa_file_path")
     if not cammesa_file_path:
         raise ValueError("No se encontró ruta de archivo CAMMESA en XCom.")
@@ -186,7 +194,6 @@ def process_and_merge_data(**kwargs):
     # --- Procesar datos de CAMMESA ---
     cammesa_df = pd.read_csv(cammesa_file_path, sep=';')
     
-    # Limpiar columna Hoy (convertir comas a puntos y espacios)
     if 'Hoy' in cammesa_df.columns:
         cammesa_df['Hoy'] = (
             cammesa_df['Hoy'].astype(str)
@@ -195,41 +202,75 @@ def process_and_merge_data(**kwargs):
         )
         cammesa_df['Hoy'] = pd.to_numeric(cammesa_df['Hoy'], errors='coerce')
 
-    # Solo quedarnos con fecha + Hoy
-    cammesa_df = cammesa_df[["fecha", "Hoy"]]
     cammesa_df["fecha_dt"] = pd.to_datetime(cammesa_df["fecha"], errors="coerce")
     cammesa_df = cammesa_df.dropna(subset=["fecha_dt"])
-    cammesa_df["hour_only"] = cammesa_df["fecha_dt"].dt.floor("H")
+    cammesa_df = cammesa_df[cammesa_df["fecha_dt"].dt.minute == 0]
+    
+    # FILTRAR: Solo las primeras 24 horas (eliminar la hora 00:00 del día siguiente)
+    cammesa_df = cammesa_df.sort_values("fecha_dt")
+    cammesa_df = cammesa_df.head(24)  # Tomar solo las primeras 24 horas
+    
+    argentina_tz = timezone('America/Argentina/Buenos_Aires')
+    cammesa_df["fecha_dt"] = cammesa_df["fecha_dt"].dt.tz_localize(argentina_tz)
+    cammesa_df["hour_only"] = cammesa_df["fecha_dt"].dt.tz_convert(argentina_tz).dt.floor("H")
+    cammesa_df["hour_only"] = cammesa_df["hour_only"].dt.tz_localize(None)
 
     # --- Procesar datos de Open-Meteo ---
     weather_df = pd.DataFrame(weather_data)
-    weather_df["datetime"] = pd.to_datetime(weather_df["time"], utc=True)
-    weather_df["datetime"] = weather_df["datetime"].dt.tz_convert("America/Argentina/Buenos_Aires")
-    weather_df["hour_only"] = weather_df["datetime"].dt.floor("H")
-
-    # Quitar timezone para que coincida con CAMMESA
+    weather_df["datetime_utc"] = pd.to_datetime(weather_df["time"], utc=True)
+    weather_df["datetime_arg"] = weather_df["datetime_utc"].dt.tz_convert(argentina_tz)
+    weather_df["hour_only"] = weather_df["datetime_arg"].dt.floor("H")
     weather_df["hour_only"] = weather_df["hour_only"].dt.tz_localize(None)
 
-    # --- Merge ---
+    # DEBUG detallado
+    logging.info(f"Total horas CAMMESA después de filtrar: {len(cammesa_df)}")
+    logging.info(f"Total horas Weather: {len(weather_df)}")
+    logging.info(f"Rango CAMMESA: {cammesa_df['hour_only'].min()} to {cammesa_df['hour_only'].max()}")
+    logging.info(f"Rango Weather: {weather_df['hour_only'].min()} to {weather_df['hour_only'].max()}")
+    
+    # Verificar que las horas coincidan exactamente
+    cammesa_hours = set(cammesa_df['hour_only'].dt.strftime('%Y-%m-%d %H:%M:%S'))
+    weather_hours = set(weather_df['hour_only'].dt.strftime('%Y-%m-%d %H:%M:%S'))
+    
+    missing_in_weather = cammesa_hours - weather_hours
+    missing_in_cammesa = weather_hours - cammesa_hours
+    
+    if missing_in_weather:
+        logging.warning(f"Horas en CAMMESA pero no en Weather: {missing_in_weather}")
+    if missing_in_cammesa:
+        logging.warning(f"Horas en Weather pero no en CAMMESA: {missing_in_cammesa}")
+
+    # --- Merge con INNER JOIN para asegurar coincidencia exacta ---
     merged_df = pd.merge(
-        cammesa_df[["hour_only", "Hoy"]],
-        weather_df.drop(columns=["time"]),
+        cammesa_df[["hour_only", "Hoy", "fecha_dt"]],
+        weather_df.drop(columns=["time", "datetime_utc", "datetime_arg"]),
         on="hour_only",
-        how="inner"
+        how="inner"  # Cambiado a inner para solo horas que coinciden
     )
 
-    # Renombrar fecha final
-    merged_df = merged_df.rename(columns={"hour_only": "fecha"})
+    logging.info(f"Registros después del merge: {len(merged_df)}")
+    
+    if len(merged_df) == 0:
+        raise ValueError("No hubo coincidencia entre horas de CAMMESA y Weather")
+    
+    # Renombrar columnas
+    merged_df = merged_df.rename(columns={
+        "hour_only": "fecha_hora",
+        "fecha_dt": "fecha_original_cammesa"
+    })
 
-    # --- Guardar dataset final ---
+    column_order = ["fecha_hora", "fecha_original_cammesa", "Hoy"] + \
+                  [col for col in merged_df.columns if col not in ["fecha_hora", "fecha_original_cammesa", "Hoy"]]
+    
+    merged_df = merged_df[column_order]
+
     output_file = f"/tmp/data/energy_weather_dataset_{execution_date.strftime('%Y%m%d')}.csv"
     os.makedirs(os.path.dirname(output_file), exist_ok=True)
     merged_df.to_csv(output_file, index=False, encoding="utf-8")
 
     logging.info(f"Dataset final guardado en {output_file}")
-    logging.info(f"Registros: {len(merged_df)}, Columnas: {list(merged_df.columns)}")
+    logging.info(f"Registros finales: {len(merged_df)}")
     
-    # Push a XCom para la siguiente tarea
     ti.xcom_push(key='final_dataset_path', value=output_file)
     
     return output_file
