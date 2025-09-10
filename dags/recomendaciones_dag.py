@@ -165,17 +165,35 @@ def extract_weather_data(**kwargs):
         raise
 
 def process_and_merge_data(**kwargs):
-    import pandas as pd
-    import os
 
     ti = kwargs["ti"]
-    weather_data = ti.xcom_pull(task_ids="extract_weather_data",key="weather_data")
+    execution_date = (
+        kwargs.get('execution_date')
+        or kwargs.get('data_interval_start')
+        or ti.execution_date
+    )
+    
+    # Obtener datos climáticos desde XCom
+    weather_data = ti.xcom_pull(task_ids="extract_weather", key="weather_data")
     if not weather_data:
         raise ValueError("No se encontraron datos climáticos en XCom.")
 
+    # Obtener ruta del archivo CAMMESA desde XCom
+    cammesa_file_path = ti.xcom_pull(task_ids="download_cammesa", key="cammesa_file_path")
+    if not cammesa_file_path:
+        raise ValueError("No se encontró ruta de archivo CAMMESA en XCom.")
+
     # --- Procesar datos de CAMMESA ---
-    cammesa_file = "/tmp/data/cammesa_data.csv"
-    cammesa_df = pd.read_csv(cammesa_file)
+    cammesa_df = pd.read_csv(cammesa_file_path, sep=';')
+    
+    # Limpiar columna Hoy (convertir comas a puntos y espacios)
+    if 'Hoy' in cammesa_df.columns:
+        cammesa_df['Hoy'] = (
+            cammesa_df['Hoy'].astype(str)
+            .str.replace(',', '.', regex=False)
+            .str.replace(' ', '', regex=False)
+        )
+        cammesa_df['Hoy'] = pd.to_numeric(cammesa_df['Hoy'], errors='coerce')
 
     # Solo quedarnos con fecha + Hoy
     cammesa_df = cammesa_df[["fecha", "Hoy"]]
@@ -196,8 +214,7 @@ def process_and_merge_data(**kwargs):
     merged_df = pd.merge(
         cammesa_df[["hour_only", "Hoy"]],
         weather_df.drop(columns=["time"]),
-        left_on="hour_only",
-        right_on="hour_only",
+        on="hour_only",
         how="inner"
     )
 
@@ -205,14 +222,17 @@ def process_and_merge_data(**kwargs):
     merged_df = merged_df.rename(columns={"hour_only": "fecha"})
 
     # --- Guardar dataset final ---
-    output_file = "/tmp/data/energy_weather_dataset.csv"
+    output_file = f"/tmp/data/energy_weather_dataset_{execution_date.strftime('%Y%m%d')}.csv"
     os.makedirs(os.path.dirname(output_file), exist_ok=True)
     merged_df.to_csv(output_file, index=False, encoding="utf-8")
 
-    print(f"Dataset final guardado en {output_file}")
+    logging.info(f"Dataset final guardado en {output_file}")
+    logging.info(f"Registros: {len(merged_df)}, Columnas: {list(merged_df.columns)}")
+    
+    # Push a XCom para la siguiente tarea
+    ti.xcom_push(key='final_dataset_path', value=output_file)
+    
     return output_file
-
-
 
 def save_to_master_dataset(**kwargs):
     """
