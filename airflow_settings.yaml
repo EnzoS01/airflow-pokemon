@@ -21,5 +21,5 @@ airflow:
       pool_slot:
       pool_description:
   variables:
-    - variable_name:
-      variable_value:
+   - variable_name: DATA_DIR
+     variable_value: /usr/local/airflow/data

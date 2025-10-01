@@ -13,7 +13,7 @@ from pytz import timezone
 default_args = {
     'owner': 'airflow',
     'depends_on_past': False,
-    'start_date': datetime(2025, 9, 9),  # Empezar desde hoy
+    'start_date': datetime(2025, 9, 9),  # Empezar desde demhoy
     'email_on_failure': False,
     'email_on_retry': False,
     'retries': 2,
@@ -21,112 +21,62 @@ default_args = {
 }
 
 def get_data_dir():
-    data_dir = os.getenv("AIRFLOW_DATA_DIR", "/tmp/data")
+    """
+    Carpeta local mapeada para guardar CSV y JSON dentro del contenedor
+    que será reflejada en Windows en C:/Users/dell/Desktop/proyecto-cd-grupo-20/data
+    """
+    data_dir = "/usr/local/airflow/data"  # Cambiado de /opt/airflow/data
     os.makedirs(data_dir, exist_ok=True)
     return data_dir
 
-def download_cammesa_data(**kwargs):
+def download_cammesa_data(region_id, region_name, **kwargs):
     ti = kwargs['ti']
     execution_date = kwargs.get('execution_date') or kwargs.get('data_interval_start') or ti.execution_date
     file_date_str = execution_date.strftime('%Y%m%d')
 
     data_dir = get_data_dir()
-    out_csv = f"{data_dir}/cammesa_data_{file_date_str}.csv"
+    out_csv = f"{data_dir}/cammesa_data_{region_name}_{file_date_str}.csv"
 
     url = "https://api.cammesa.com/demanda-svc/demanda/ObtieneDemandaYTemperaturaRegion"
-    params = {"id_region": "425"}  # id correspondiente al Gran Buenos Aires
+    params = {"id_region": str(region_id)}
     headers = {
         "User-Agent": "Mozilla/5.0",
         "Accept": "application/json, text/plain, */*",
         "Referer": "https://api.cammesa.com/",
-    } # headers necesarios
+    }
 
     r = requests.get(url, params=params, headers=headers, timeout=60, verify=False)
     r.raise_for_status()
 
-    max_retries = 5
-    for attempt in range(max_retries):
-        try:
-            r = requests.get(url, params=params, headers=headers, timeout=60, verify=False)
-            r.raise_for_status()
-            break
-        except requests.exceptions.SSLError as e:
-            logging.warning(f"SSL error en intento {attempt+1}/{max_retries}: {e}")
-            if attempt < max_retries - 1:
-                time.sleep(5 * (attempt+1))  # backoff exponencial
-            else:
-                raise
-
-    # La API devuelve JSON, no CSV directo
-    data = r.json()
-
-    # Convertir JSON a DataFrame
-    df = pd.DataFrame(data)
-
-    # Renombrar columnas para que coincidan con el formato del CSV manual
-    column_mapping = {
-        'fecha': 'fecha',
-        'demPrevista': 'Prevista',
-        'demSemanaAnt': 'Semana Ant',
-        'demAyer': 'Ayer',
-        'demHoy': 'Hoy',
-        'tempPrevista': 'Tem. Prevista',
-        'tempSemanaAnt': 'Tem. Semana Ant.',
-        'tempAyer': 'Tem. Ayer',
-        'tempHoy': 'Tem. Hoy'
-    }
-
-    df = df.rename(columns=column_mapping)
-    # Asegurar que tengamos todas las columnas esperadas
-    expected_columns = ['fecha', 'Prevista', 'Semana Ant', 'Ayer', 'Hoy', 
-                       'Tem. Prevista', 'Tem. Semana Ant.', 'Tem. Ayer', 'Tem. Hoy']
-    
-    for col in expected_columns:
-        if col not in df.columns:
-            df[col] = None  # Añadir columnas faltantes con valores nulos
-    
-    # Reordenar columnas
-    df = df[expected_columns]
-    
-    # Formatear fecha correctamente (de ISO a formato esperado)
-    df['fecha'] = pd.to_datetime(df['fecha']).dt.strftime('%Y-%m-%d %H:%M:%S')
-    
-    # Guardar como CSV con el formato correcto
+    df = pd.DataFrame(r.json())
+    # acá podés aplicar el mismo procesamiento de columnas que ya hiciste
     df.to_csv(out_csv, index=False, sep=';', encoding='utf-8')
-    
-    logging.info(f"Guardado CSV formateado en {out_csv}")
-    logging.info(f"Registros: {len(df)}, Columnas: {list(df.columns)}")
-    ti.xcom_push(key='cammesa_file_path', value=out_csv)
-    ti.xcom_push(key='download_date', value=execution_date.strftime('%Y-%m-%d'))
-    return f"Datos CAMMESA: {out_csv}"
 
-def extract_weather_data(**kwargs):
+    logging.info(f"Guardado CSV {region_name} en {out_csv}")
+    ti.xcom_push(key=f'cammesa_file_path_{region_name}', value=out_csv)
+    return f"Datos CAMMESA {region_name}: {out_csv}"
+
+def extract_weather_data(region_name, latitude, longitude, **kwargs):
     """
-    Extrae datos climáticos de Open-Meteo (forecast) para Buenos Aires.
-    Ajustado para coincidir con el huso horario de Argentina.
+    Extrae datos climáticos de Open-Meteo para una región específica.
     """
     ti = kwargs['ti']
-    execution_date = (
-        kwargs.get('execution_date')
-        or kwargs.get('data_interval_start')
-        or ti.execution_date
-    )
+    execution_date = kwargs.get('execution_date') or kwargs.get('data_interval_start') or ti.execution_date
     
-    # Convertir a huso horario de Argentina
     argentina_tz = timezone('America/Argentina/Buenos_Aires')
     execution_date_arg = execution_date.astimezone(argentina_tz)
     date_str = execution_date_arg.strftime('%Y-%m-%d')
     
-    logging.info(f"Descargando datos climáticos para: {date_str} (huso Argentina)")
+    logging.info(f"[{region_name}] Descargando datos climáticos para: {date_str} (huso Argentina)")
     
     url = "https://api.open-meteo.com/v1/forecast"
     params = {
-        "latitude": -34.61,
-        "longitude": -58.37,
+        "latitude": latitude,
+        "longitude": longitude,
         "start_date": date_str,
         "end_date": date_str,
         "hourly": "temperature_2m,relative_humidity_2m,precipitation,wind_speed_10m,wind_direction_10m,pressure_msl,cloudcover",
-        "timezone": "auto"  # Especificar el huso horario correcto
+        "timezone": "auto"
     }
     
     try:
@@ -134,173 +84,175 @@ def extract_weather_data(**kwargs):
         response.raise_for_status()
         data = response.json()
         
-        # Procesamiento de datos (mantener igual)
+        # Crear DataFrame
         hourly = data.get("hourly", {})
-        keys = ["time", "temperature_2m", "relative_humidity_2m",
-                "precipitation", "wind_speed_10m", "wind_direction_10m",
-                "pressure_msl", "cloudcover"]
-        
-        for key in keys:
+        for key in ["time","temperature_2m","relative_humidity_2m","precipitation",
+                    "wind_speed_10m","wind_direction_10m","pressure_msl","cloudcover"]:
             if key not in hourly:
-                logging.warning(f"'{key}' no está en la respuesta, se llena con NaN")
                 hourly[key] = [np.nan] * len(hourly.get("time", []))
-        
-        # Crear DataFrame con DatetimeIndex en huso horario de Argentina
         weather_df = pd.DataFrame(hourly)
         weather_df['time'] = pd.to_datetime(weather_df['time'])
         weather_df = weather_df.set_index('time')
         
-        registros = len(weather_df)
-        logging.info(f"Datos climáticos descargados: {registros} registros")
-        logging.info(f"Rango horario clima: {weather_df.index.min()} to {weather_df.index.max()}")
-        
         # Guardar JSON
         data_dir = get_data_dir()
-        weather_file_path = f"{data_dir}/weather_data_{execution_date_arg.strftime('%Y%m%d')}.json"
+        weather_file_path = f"{data_dir}/weather_data_{region_name}_{execution_date_arg.strftime('%Y%m%d')}.json"
         with open(weather_file_path, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
         
         # XCom
-        ti.xcom_push(key="weather_data", value=hourly)
-        ti.xcom_push(key="weather_file_path", value=weather_file_path)
+        ti.xcom_push(key=f"weather_data_{region_name}", value=hourly)
+        ti.xcom_push(key=f"weather_file_path_{region_name}", value=weather_file_path)
         
-        return f"Datos climáticos obtenidos: {weather_file_path}"
+        return f"[{region_name}] Datos climáticos obtenidos: {weather_file_path}"
     
     except Exception as e:
-        logging.error(f"Error al obtener datos climáticos: {str(e)}")
+        logging.error(f"[{region_name}] Error al obtener datos climáticos: {str(e)}")
         raise
+
+
 def process_and_merge_data(**kwargs):
-    import pandas as pd
-    import os
-    import logging
-
     ti = kwargs["ti"]
-    execution_date = (
-        kwargs.get('execution_date')
-        or kwargs.get('data_interval_start')
-        or ti.execution_date
-    )
+    execution_date = kwargs.get('execution_date') or kwargs.get('data_interval_start') or ti.execution_date
+    file_date_str = execution_date.strftime('%Y%m%d')
 
-    # --- Recuperar XComs ---
-    weather_data = ti.xcom_pull(task_ids="extract_weather", key="weather_data")
-    if not weather_data:
-        raise ValueError("No se encontraron datos climáticos en XCom.")
+    argentina_tz = timezone('America/Argentina/Buenos_Aires')
 
-    cammesa_file_path = ti.xcom_pull(task_ids="download_cammesa", key="cammesa_file_path")
-    if not cammesa_file_path:
-        raise ValueError("No se encontró ruta de archivo CAMMESA en XCom.")
+    regions = [
+        {"name": "edenor", "cammesa_task": "download_cammesa_edenor", "weather_key": "weather_data_edenor"},
+        {"name": "edesur", "cammesa_task": "download_cammesa_edesur", "weather_key": "weather_data_edesur"},
+        {"name": "edelap", "cammesa_task": "download_cammesa_edelap", "weather_key": "weather_data_edelap"},
+    ]
 
-    # --- Procesar datos de CAMMESA ---
-    cammesa_df = pd.read_csv(cammesa_file_path, sep=';')
+    output_files = []
 
-    if 'Hoy' in cammesa_df.columns:
-        cammesa_df['Hoy'] = (
-            cammesa_df['Hoy'].astype(str)
+    for region in regions:
+        region_name = region["name"]
+
+        # --- Recuperar XComs ---
+        weather_data = ti.xcom_pull(task_ids=f"extract_weather_{region_name}", key=region["weather_key"])
+        if not weather_data:
+            raise ValueError(f"No se encontraron datos climáticos para {region_name} en XCom.")
+
+        cammesa_file_path = ti.xcom_pull(task_ids=region["cammesa_task"], key=f"cammesa_file_path_{region_name}")
+        if not cammesa_file_path:
+            raise ValueError(f"No se encontró archivo CAMMESA para {region_name} en XCom.")
+
+        # --- Procesar CAMMESA ---
+        cammesa_df = pd.read_csv(cammesa_file_path, sep=';')
+        cammesa_df.columns = cammesa_df.columns.str.strip()  # limpiar espacios invisibles
+
+        if 'demHoy' not in cammesa_df.columns:
+            raise KeyError(f"La columna 'demHoy' no existe en {cammesa_file_path}. Columnas: {cammesa_df.columns.tolist()}")
+
+        cammesa_df['demHoy'] = (
+            cammesa_df['demHoy'].astype(str)
             .str.replace(',', '.', regex=False)
             .str.replace(' ', '', regex=False)
         )
-        cammesa_df['Hoy'] = pd.to_numeric(cammesa_df['Hoy'], errors='coerce')
+        cammesa_df['demHoy'] = pd.to_numeric(cammesa_df['demHoy'], errors='coerce')
 
-    # Fechas vienen en hora local ya (ARG)
-    cammesa_df["fecha_dt"] = pd.to_datetime(cammesa_df["fecha"], errors="coerce")
-    cammesa_df = cammesa_df.dropna(subset=["fecha_dt"])
-    cammesa_df = cammesa_df[cammesa_df["fecha_dt"].dt.minute == 0]
+        cammesa_df["fecha_dt"] = pd.to_datetime(cammesa_df["fecha"], errors="coerce")
+        cammesa_df = cammesa_df.dropna(subset=["fecha_dt"])
+        cammesa_df = cammesa_df[cammesa_df["fecha_dt"].dt.minute == 0]
+        cammesa_df = cammesa_df.sort_values("fecha_dt").head(24)
 
-    # Tomar solo 24 horas del día
-    cammesa_df = cammesa_df.sort_values("fecha_dt").head(24)
-    cammesa_df["hour_only"] = cammesa_df["fecha_dt"].dt.floor("H")
+        # --- Asegurar tz-aware ---
+        cammesa_df["hour_only"] = cammesa_df["fecha_dt"].dt.floor("H")
+        if cammesa_df["hour_only"].dt.tz is None:
+            cammesa_df["hour_only"] = cammesa_df["hour_only"].dt.tz_localize(argentina_tz)
 
-    # --- Procesar datos de Weather ---
-    weather_df = pd.DataFrame(weather_data)
+        # --- Procesar Weather ---
+        weather_df = pd.DataFrame(weather_data)
+        weather_df["datetime_arg"] = pd.to_datetime(weather_df["time"], errors="coerce")
+        weather_df["hour_only"] = weather_df["datetime_arg"].dt.floor("H")
+        if weather_df["hour_only"].dt.tz is None:
+            weather_df["hour_only"] = weather_df["hour_only"].dt.tz_localize(argentina_tz)
+        else:
+            weather_df["hour_only"] = weather_df["hour_only"].dt.tz_convert(argentina_tz)
 
-    # Ojo: Open-Meteo con timezone=auto ya devuelve en ARG
-    weather_df["datetime_arg"] = pd.to_datetime(weather_df["time"], errors="coerce")
-    weather_df["hour_only"] = weather_df["datetime_arg"].dt.floor("H")
+        # --- Merge ---
+        merged_df = pd.merge(
+            cammesa_df[["hour_only", "demHoy", "fecha_dt"]],
+            weather_df.drop(columns=["time", "datetime_arg"]),
+            on="hour_only",
+            how="inner"
+        )
 
-    # --- Logs para debugging ---
-    logging.info(f"Horas CAMMESA ({len(cammesa_df)}): "
-                 f"{cammesa_df['hour_only'].min()} -> {cammesa_df['hour_only'].max()}")
-    logging.info(f"Horas Weather ({len(weather_df)}): "
-                 f"{weather_df['hour_only'].min()} -> {weather_df['hour_only'].max()}")
+        if merged_df.empty:
+            raise ValueError(f"No hubo coincidencia entre horas de CAMMESA y Weather para {region_name}")
 
-    # --- Merge ---
-    merged_df = pd.merge(
-        cammesa_df[["hour_only", "Hoy", "fecha_dt"]],
-        weather_df.drop(columns=["time", "datetime_arg"]),
-        on="hour_only",
-        how="inner"
-    )
+        merged_df = merged_df.rename(columns={"hour_only": "fecha", "fecha_dt": "fecha_original_cammesa"})
 
-    if merged_df.empty:
-        raise ValueError("No hubo coincidencia entre horas de CAMMESA y Weather")
+        column_order = ["fecha", "fecha_original_cammesa", "demHoy"] + \
+                       [c for c in merged_df.columns if c not in ["fecha", "fecha_original_cammesa", "demHoy"]]
+        merged_df = merged_df[column_order]
 
-    merged_df = merged_df.rename(columns={
-        "hour_only": "fecha",
-        "fecha_dt": "fecha_original_cammesa"
-    })
+        # --- Guardar CSV por región ---
+        data_dir = get_data_dir()
+        output_file = f"{data_dir}/energy_weather_dataset_{region_name}_{file_date_str}.csv"
+        merged_df.to_csv(output_file, index=False, encoding="utf-8")
+        logging.info(f"[{region_name}] Dataset final guardado en {output_file} con {len(merged_df)} registros")
 
-    column_order = ["fecha", "fecha_original_cammesa", "Hoy"] + \
-                   [c for c in merged_df.columns if c not in ["fecha", "fecha_original_cammesa", "Hoy"]]
-    merged_df = merged_df[column_order]
+        # XCom por región
+        ti.xcom_push(key=f'final_dataset_path_{region_name}', value=output_file)
+        output_files.append(output_file)
 
-    # Guardar resultado
-    output_file = f"/tmp/data/energy_weather_dataset_{execution_date.strftime('%Y%m%d')}.csv"
-    os.makedirs(os.path.dirname(output_file), exist_ok=True)
-    merged_df.to_csv(output_file, index=False, encoding="utf-8")
-
-    logging.info(f"Dataset final guardado en {output_file} con {len(merged_df)} registros")
-
-    ti.xcom_push(key='final_dataset_path', value=output_file)
-    return output_file
+    return output_files
 
 
 def save_to_master_dataset(**kwargs):
     """
-    Agrega los datos procesados al dataset maestro histórico
+    Agrega los datos procesados al dataset maestro histórico para cada región
+    y guarda los 3 CSVs maestros en la carpeta mapeada al host.
     """
     import pandas as pd
     import os
     import logging
 
     ti = kwargs['ti']
-    daily_dataset_path = ti.xcom_pull(key='final_dataset_path', task_ids='process_merge_data')
-    
-    # Leer datos del día
-    daily_df = pd.read_csv(daily_dataset_path)
 
-    # Asegurarse de que la columna fecha exista
-    if 'fecha' not in daily_df.columns:
-        raise ValueError(f"No se encontró la columna 'fecha' en daily_df. Columnas: {daily_df.columns.tolist()}")
-    
-    daily_df['fecha'] = pd.to_datetime(daily_df['fecha'], errors='coerce')
+    regions = ["edenor", "edesur", "edelap"]
+    data_dir = get_data_dir()
 
-    # Ruta del dataset maestro
-    master_dataset_path = "/tmp/data/master_energy_dataset.csv"
-    
-    if os.path.exists(master_dataset_path):
-        master_df = pd.read_csv(master_dataset_path)
-        
-        # Asegurarse que master_df tenga fecha
-        if 'fecha' not in master_df.columns:
-            master_df['fecha'] = pd.to_datetime(master_df['fecha'], errors='coerce')
-        
-        # Combinar, eliminar duplicados y ordenar
-        combined_df = pd.concat([master_df, daily_df], ignore_index=True)
-        combined_df.drop_duplicates(subset=['fecha'], inplace=True)
-        if 'fecha' in combined_df.columns:
-            combined_df['fecha'] = pd.to_datetime(combined_df['fecha'], errors='coerce')
-            combined_df = combined_df.drop_duplicates(subset=['fecha'])
-            combined_df = combined_df.sort_values('fecha')
-        combined_df.sort_values('fecha', inplace=True)
-        combined_df.to_csv(master_dataset_path, index=False)
-        logging.info(f"Dataset maestro actualizado: {len(combined_df)} registros totales")
-    else:
-        # Crear nuevo dataset maestro y asegurarse que fecha sea datetime
-        daily_df.sort_values('fecha', inplace=True)
-        daily_df.to_csv(master_dataset_path, index=False)
-        logging.info(f"Dataset maestro creado: {len(daily_df)} registros")
-    
-    return f"Dataset maestro actualizado: {master_dataset_path}"
+    for region in regions:
+        # Recuperar dataset diario procesado
+        daily_dataset_path = ti.xcom_pull(key=f'final_dataset_path_{region}', task_ids='process_merge_data')
+        if not daily_dataset_path:
+            logging.warning(f"No se encontró dataset diario para {region}, se salta.")
+            continue
+
+        daily_df = pd.read_csv(daily_dataset_path)
+
+        # Asegurar columna fecha como datetime
+        if 'fecha' not in daily_df.columns:
+            raise ValueError(f"No se encontró la columna 'fecha' en daily_df de {region}")
+        daily_df['fecha'] = pd.to_datetime(daily_df['fecha'], errors='coerce')
+
+        # Archivo maestro por región
+        master_file_path = os.path.join(data_dir, f"master_energy_dataset_{region}.csv")
+
+        if os.path.exists(master_file_path):
+            master_df = pd.read_csv(master_file_path)
+            
+            # CORRECCIÓN: Siempre convertir la columna fecha a datetime
+            if 'fecha' in master_df.columns:
+                master_df['fecha'] = pd.to_datetime(master_df['fecha'], errors='coerce')
+            else:
+                raise ValueError(f"No se encontró la columna 'fecha' en master_df de {region}")
+
+            # Combinar, eliminar duplicados y ordenar
+            combined_df = pd.concat([master_df, daily_df], ignore_index=True)
+            combined_df.drop_duplicates(subset=['fecha'], inplace=True)
+            combined_df.sort_values('fecha', inplace=True)
+            combined_df.to_csv(master_file_path, index=False)
+            logging.info(f"[{region}] Dataset maestro actualizado: {len(combined_df)} registros")
+        else:
+            daily_df.sort_values('fecha', inplace=True)
+            daily_df.to_csv(master_file_path, index=False)
+            logging.info(f"[{region}] Dataset maestro creado: {len(daily_df)} registros")
+
+    return f"Datasets maestros actualizados en {data_dir}"
 
 
 # DAG principal
@@ -315,17 +267,41 @@ with DAG(
 ) as dag:
     
     # Descargar datos de CAMMESA
-    download_cammesa_task = PythonOperator(
-        task_id='download_cammesa',
+    download_edenor = PythonOperator(
+        task_id="download_cammesa_edenor",
         python_callable=download_cammesa_data,
-        execution_timeout=timedelta(minutes=10)
+        op_args=[1077, "edenor"],
+    )
+
+    download_edesur = PythonOperator(   
+        task_id="download_cammesa_edesur",
+        python_callable=download_cammesa_data,
+        op_args=[1078, "edesur"],
+    )
+
+    download_edelap = PythonOperator(
+        task_id="download_cammesa_edelap",
+        python_callable=download_cammesa_data,
+        op_args=[1943, "edelap"],
     )
     
     # Extraer datos climáticos
-    extract_weather_task = PythonOperator(
-        task_id='extract_weather',
+    extract_weather_edenor = PythonOperator(
+        task_id='extract_weather_edenor',
         python_callable=extract_weather_data,
-        execution_timeout=timedelta(minutes=5)
+        op_args=["edenor", -34.57, -58.46]  # ejemplo de coordenadas
+    )
+
+    extract_weather_edesur = PythonOperator(
+        task_id='extract_weather_edesur',
+        python_callable=extract_weather_data,
+        op_args=["edesur", -34.66, -58.45]
+    )
+
+    extract_weather_edelap = PythonOperator(
+        task_id='extract_weather_edelap',
+        python_callable=extract_weather_data,
+        op_args=["edelap", -34.91, -57.95]
     )
     
     # Procesar y combinar datos
@@ -343,4 +319,6 @@ with DAG(
     )
     
     # Definir dependencias
-    [download_cammesa_task, extract_weather_task] >> process_merge_task >> save_master_task
+[download_edenor, download_edesur, download_edelap,
+ extract_weather_edenor, extract_weather_edesur, extract_weather_edelap] >> process_merge_task >> save_master_task
+
