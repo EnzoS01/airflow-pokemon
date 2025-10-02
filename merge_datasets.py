@@ -9,7 +9,7 @@ def merge_dataset(region_name):
     dest_file = f"./data/master_energy_dataset_{region_name}.csv"
     
     if not os.path.exists(temp_file):
-        print(f"⚠️  No se encontró archivo temporal para {region_name}")
+        print(f" No se encontró archivo temporal para {region_name}")
         return
     
     # Leer archivo nuevo del contenedor
@@ -45,4 +45,4 @@ if __name__ == "__main__":
     for region in ["edenor", "edesur", "edelap"]:
         merge_dataset(region)
     
-    print("\n✅ Fusión completada!")
+    print("\n Fusión completada!")

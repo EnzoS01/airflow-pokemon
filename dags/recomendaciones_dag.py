@@ -9,11 +9,13 @@ import os
 import logging
 import numpy as np
 from pytz import timezone
+import random
+import time
 
 default_args = {
     'owner': 'airflow',
     'depends_on_past': False,
-    'start_date': datetime(2025, 9, 9),  # Empezar desde demhoy
+    'start_date': datetime(2025, 9, 9),  # Empezar desde hoy
     'email_on_failure': False,
     'email_on_retry': False,
     'retries': 2,
@@ -30,85 +32,133 @@ def get_data_dir():
     return data_dir
 
 def download_cammesa_data(region_id, region_name, **kwargs):
+    """
+    Descarga datos históricos de CAMMESA para una región (últimos 60 días)
+    usando el endpoint 'ObtieneDemandaYTemperaturaRegionByFecha'.
+    """
     ti = kwargs['ti']
     execution_date = kwargs.get('execution_date') or kwargs.get('data_interval_start') or ti.execution_date
-    file_date_str = execution_date.strftime('%Y%m%d')
+
+    # Fecha final = día de ejecución, fecha inicial = 60 días antes
+    fecha_fin = execution_date.date()
+    fecha_inicio = fecha_fin - timedelta(days=60)
 
     data_dir = get_data_dir()
-    out_csv = f"{data_dir}/cammesa_data_{region_name}_{file_date_str}.csv"
+    out_csv = f"{data_dir}/cammesa_data_{region_name}_{fecha_inicio.strftime('%Y%m%d')}_{fecha_fin.strftime('%Y%m%d')}.csv"
 
-    url = "https://api.cammesa.com/demanda-svc/demanda/ObtieneDemandaYTemperaturaRegion"
-    params = {"id_region": str(region_id)}
+    url = "https://api.cammesa.com/demanda-svc/demanda/ObtieneDemandaYTemperaturaRegionByFecha"
     headers = {
         "User-Agent": "Mozilla/5.0",
         "Accept": "application/json, text/plain, */*",
         "Referer": "https://api.cammesa.com/",
     }
 
-    r = requests.get(url, params=params, headers=headers, timeout=60, verify=False)
-    r.raise_for_status()
+    all_dfs = []
+    for single_date in pd.date_range(fecha_inicio, fecha_fin, freq="D"):
+        fecha_str = single_date.strftime("%Y-%m-%d")
+        params = {"id_region": str(region_id), "fecha": fecha_str}
+        
+        try:
+            r = requests.get(url, params=params, headers=headers, timeout=60, verify=False)
+            r.raise_for_status()
+            data_json = r.json()
 
-    df = pd.DataFrame(r.json())
-    # acá podés aplicar el mismo procesamiento de columnas que ya hiciste
-    df.to_csv(out_csv, index=False, sep=';', encoding='utf-8')
+            if isinstance(data_json, list) and len(data_json) > 0:
+                df = pd.DataFrame(data_json)
+                df["fecha_consulta"] = fecha_str  # registrar de qué fecha vino
+                all_dfs.append(df)
+                logging.info(f"[{region_name}] Datos obtenidos para {fecha_str} ({len(df)} registros)")
+            else:
+                logging.warning(f"[{region_name}] Sin datos para {fecha_str}")
 
-    logging.info(f"Guardado CSV {region_name} en {out_csv}")
+        except Exception as e:
+            logging.error(f"[{region_name}] Error en fecha {fecha_str}: {e}")
+
+        # Esperar entre 2 y 5 segundos antes del próximo request
+        sleep_time = random.uniform(2, 5)
+        logging.info(f"[{region_name}] Esperando {sleep_time:.2f} segundos antes de la próxima consulta...")
+        time.sleep(sleep_time)
+
+    if not all_dfs:
+        raise ValueError(f"No se obtuvieron datos históricos para {region_name}")
+
+    final_df = pd.concat(all_dfs, ignore_index=True)
+
+    # Limpieza de columnas (ej: 'Hoy')
+    if "Hoy" in final_df.columns:
+        final_df["Hoy"] = (
+            final_df["Hoy"].astype(str)
+            .str.replace(",", ".", regex=False)
+            .str.replace(" ", "", regex=False)
+        )
+        final_df["Hoy"] = pd.to_numeric(final_df["Hoy"], errors="coerce")
+
+    final_df.to_csv(out_csv, index=False, sep=";", encoding="utf-8")
+    logging.info(f"[{region_name}] Guardado histórico (60 días) en {out_csv}")
+
     ti.xcom_push(key=f'cammesa_file_path_{region_name}', value=out_csv)
-    return f"Datos CAMMESA {region_name}: {out_csv}"
+    return f"Datos CAMMESA históricos {region_name}: {out_csv}"
+
 
 def extract_weather_data(region_name, latitude, longitude, **kwargs):
     """
-    Extrae datos climáticos de Open-Meteo para una región específica.
+    Extrae datos climáticos históricos de Open-Meteo (últimos 60 días)
+    para una región específica, usando la API de archive.
     """
     ti = kwargs['ti']
     execution_date = kwargs.get('execution_date') or kwargs.get('data_interval_start') or ti.execution_date
-    
+
+    # Fechas de rango (últimos 60 días hasta la fecha de ejecución)
+    fecha_fin = execution_date.date()
+    fecha_inicio = fecha_fin - timedelta(days=60)
+
     argentina_tz = timezone('America/Argentina/Buenos_Aires')
-    execution_date_arg = execution_date.astimezone(argentina_tz)
-    date_str = execution_date_arg.strftime('%Y-%m-%d')
-    
-    logging.info(f"[{region_name}] Descargando datos climáticos para: {date_str} (huso Argentina)")
-    
-    url = "https://api.open-meteo.com/v1/forecast"
+
+    url = "https://archive-api.open-meteo.com/v1/archive"
     params = {
         "latitude": latitude,
         "longitude": longitude,
-        "start_date": date_str,
-        "end_date": date_str,
+        "start_date": fecha_inicio.strftime("%Y-%m-%d"),
+        "end_date": fecha_fin.strftime("%Y-%m-%d"),
         "hourly": "temperature_2m,relative_humidity_2m,precipitation,wind_speed_10m,wind_direction_10m,pressure_msl,cloudcover",
         "timezone": "auto"
     }
-    
+
+    logging.info(f"[{region_name}] Descargando datos climáticos históricos desde {params['start_date']} hasta {params['end_date']}")
+
     try:
-        response = requests.get(url, params=params, timeout=30)
+        response = requests.get(url, params=params, timeout=60)
         response.raise_for_status()
         data = response.json()
-        
-        # Crear DataFrame
+
+        # Crear DataFrame con las variables horarias
         hourly = data.get("hourly", {})
         for key in ["time","temperature_2m","relative_humidity_2m","precipitation",
                     "wind_speed_10m","wind_direction_10m","pressure_msl","cloudcover"]:
             if key not in hourly:
                 hourly[key] = [np.nan] * len(hourly.get("time", []))
         weather_df = pd.DataFrame(hourly)
+
+        # Asegurar index temporal
         weather_df['time'] = pd.to_datetime(weather_df['time'])
         weather_df = weather_df.set_index('time')
-        
-        # Guardar JSON
+
+        # Guardar JSON histórico por región
         data_dir = get_data_dir()
-        weather_file_path = f"{data_dir}/weather_data_{region_name}_{execution_date_arg.strftime('%Y%m%d')}.json"
+        weather_file_path = f"{data_dir}/weather_data_{region_name}_{fecha_inicio.strftime('%Y%m%d')}_{fecha_fin.strftime('%Y%m%d')}.json"
         with open(weather_file_path, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
-        
-        # XCom
+
+        # XComs (para merge posterior)
         ti.xcom_push(key=f"weather_data_{region_name}", value=hourly)
         ti.xcom_push(key=f"weather_file_path_{region_name}", value=weather_file_path)
-        
-        return f"[{region_name}] Datos climáticos obtenidos: {weather_file_path}"
-    
+
+        return f"[{region_name}] Datos climáticos históricos obtenidos: {weather_file_path}"
+
     except Exception as e:
-        logging.error(f"[{region_name}] Error al obtener datos climáticos: {str(e)}")
+        logging.error(f"[{region_name}] Error al obtener datos climáticos históricos: {str(e)}")
         raise
+
 
 
 def process_and_merge_data(**kwargs):
@@ -129,7 +179,7 @@ def process_and_merge_data(**kwargs):
     for region in regions:
         region_name = region["name"]
 
-        # --- Recuperar XComs ---
+        # --- Recuperar datos del XCom ---
         weather_data = ti.xcom_pull(task_ids=f"extract_weather_{region_name}", key=region["weather_key"])
         if not weather_data:
             raise ValueError(f"No se encontraron datos climáticos para {region_name} en XCom.")
@@ -142,22 +192,24 @@ def process_and_merge_data(**kwargs):
         cammesa_df = pd.read_csv(cammesa_file_path, sep=';')
         cammesa_df.columns = cammesa_df.columns.str.strip()  # limpiar espacios invisibles
 
-        if 'demHoy' not in cammesa_df.columns:
-            raise KeyError(f"La columna 'demHoy' no existe en {cammesa_file_path}. Columnas: {cammesa_df.columns.tolist()}")
+        if 'dem' not in cammesa_df.columns:
+            raise KeyError(f"La columna 'dem' no existe en {cammesa_file_path}. Columnas: {cammesa_df.columns.tolist()}")
 
-        cammesa_df['demHoy'] = (
-            cammesa_df['demHoy'].astype(str)
+        # Normalizar valores de demanda
+        cammesa_df['dem'] = (
+            cammesa_df['dem'].astype(str)
             .str.replace(',', '.', regex=False)
             .str.replace(' ', '', regex=False)
         )
-        cammesa_df['demHoy'] = pd.to_numeric(cammesa_df['demHoy'], errors='coerce')
+        cammesa_df['dem'] = pd.to_numeric(cammesa_df['dem'], errors='coerce')
 
+        # Parseo de fechas CAMMESA
         cammesa_df["fecha_dt"] = pd.to_datetime(cammesa_df["fecha"], errors="coerce")
         cammesa_df = cammesa_df.dropna(subset=["fecha_dt"])
-        cammesa_df = cammesa_df[cammesa_df["fecha_dt"].dt.minute == 0]
-        cammesa_df = cammesa_df.sort_values("fecha_dt").head(24)
+        cammesa_df = cammesa_df[cammesa_df["fecha_dt"].dt.minute == 0]  # solo en punto
+        cammesa_df = cammesa_df.sort_values("fecha_dt")
 
-        # --- Asegurar tz-aware ---
+        # Extraer hora en tz Argentina
         cammesa_df["hour_only"] = cammesa_df["fecha_dt"].dt.floor("H")
         if cammesa_df["hour_only"].dt.tz is None:
             cammesa_df["hour_only"] = cammesa_df["hour_only"].dt.tz_localize(argentina_tz)
@@ -171,9 +223,9 @@ def process_and_merge_data(**kwargs):
         else:
             weather_df["hour_only"] = weather_df["hour_only"].dt.tz_convert(argentina_tz)
 
-        # --- Merge ---
+        # --- Merge exacto por hora ---
         merged_df = pd.merge(
-            cammesa_df[["hour_only", "demHoy", "fecha_dt"]],
+            cammesa_df[["hour_only", "dem", "fecha_dt"]],
             weather_df.drop(columns=["time", "datetime_arg"]),
             on="hour_only",
             how="inner"
@@ -182,10 +234,12 @@ def process_and_merge_data(**kwargs):
         if merged_df.empty:
             raise ValueError(f"No hubo coincidencia entre horas de CAMMESA y Weather para {region_name}")
 
+        # Renombrar columnas
         merged_df = merged_df.rename(columns={"hour_only": "fecha", "fecha_dt": "fecha_original_cammesa"})
 
-        column_order = ["fecha", "fecha_original_cammesa", "demHoy"] + \
-                       [c for c in merged_df.columns if c not in ["fecha", "fecha_original_cammesa", "demHoy"]]
+        # Reordenar columnas
+        column_order = ["fecha", "fecha_original_cammesa", "dem"] + \
+                       [c for c in merged_df.columns if c not in ["fecha", "fecha_original_cammesa", "dem"]]
         merged_df = merged_df[column_order]
 
         # --- Guardar CSV por región ---
@@ -199,6 +253,7 @@ def process_and_merge_data(**kwargs):
         output_files.append(output_file)
 
     return output_files
+
 
 
 def save_to_master_dataset(**kwargs):
